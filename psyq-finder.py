@@ -525,6 +525,14 @@ class ScanSignature:
     anchor_offset: int   # Offset of the anchor within the signature
     anchor_bytes: bytes  # Longest consecutive concrete byte run
     concrete_count: int  # Number of non-wildcard bytes (for match stats)
+    subsumption_group: int = -1  # ID linking sigs that are prefixes of each other
+
+
+@dataclass
+class VersionGroup:
+    """A group of SDK versions sharing the same signature variant for an object."""
+    versions: list[str]
+    sig_length: int
 
 
 @dataclass
@@ -533,9 +541,22 @@ class ScanResult:
     offset: int
     library: str
     object_name: str
-    versions: list[str]
-    sig_length: int
+    version_groups: list[VersionGroup]  # One group if unambiguous, multiple if subsumed
     labels: list[Label]  # Functions within this object
+    is_ambiguous: bool = False  # True if multiple version groups due to subsumption
+
+    @property
+    def versions(self) -> list[str]:
+        """All versions across all groups (for filtering and backward compat)."""
+        all_v = []
+        for vg in self.version_groups:
+            all_v.extend(vg.versions)
+        return all_v
+    
+    @property
+    def sig_length(self) -> int:
+        """Longest signature length across groups."""
+        return max(vg.sig_length for vg in self.version_groups)
 
 
 class ScanEngine:
@@ -686,15 +707,133 @@ class ScanEngine:
             sig.versions.sort(key=parse_sdk_version)
         
         self._labels_map = labels_map
+        
+        # Detect prefix/subsumption relationships
+        self._progress_message = "Detecting signature subsumptions..."
+        self._detect_subsumptions()
+        
         self._preprocessed = True
         self._progress_pct = 1.0
         
         # Stats
         total_across_versions = sum(len(s.versions) for s in self._signatures)
+        num_groups = len(set(s.subsumption_group for s in self._signatures if s.subsumption_group >= 0))
+        subsumption_msg = f", {num_groups} subsumption groups" if num_groups else ""
         self._progress_message = (
             f"Preprocessed {len(self._signatures)} unique signatures "
-            f"({total_across_versions} total across versions)"
+            f"({total_across_versions} total across versions{subsumption_msg})"
         )
+    
+    def _detect_subsumptions(self) -> None:
+        """
+        Detect prefix/subsumption relationships between signatures.
+        
+        For the same (library, object_name), if signature A is shorter than B
+        and every concrete byte in A matches the corresponding position in B,
+        then any binary matching B will also match A. We tag these with the
+        same subsumption_group ID so the scanner can merge them in results.
+        """
+        # Group signatures by (library, object_name)
+        from collections import defaultdict
+        groups: dict[tuple[str, str], list[ScanSignature]] = defaultdict(list)
+        
+        for sig in self._signatures:
+            groups[(sig.library, sig.object_name)].append(sig)
+        
+        next_group_id = 0
+        
+        for key, sigs in groups.items():
+            if len(sigs) < 2:
+                continue  # No subsumption possible with a single signature
+            
+            # Sort by length so we check shorter against longer
+            sigs.sort(key=lambda s: s.sig_length)
+            
+            # For each pair, check if shorter is subsumed by longer.
+            # A is subsumed by B means: for every position i < len(A) where 
+            # A.mask[i] == 0xFF (concrete), B.mask[i] must also be 0xFF 
+            # and A.data[i] == B.data[i].
+            # In other words: anything matching B also matches A at the prefix.
+            
+            # Track which sigs are in a subsumption relationship
+            related: set[int] = set()  # indices into sigs list
+            
+            for i in range(len(sigs)):
+                for j in range(i + 1, len(sigs)):
+                    shorter = sigs[i]
+                    longer = sigs[j]
+                    
+                    if shorter.sig_length >= longer.sig_length:
+                        continue  # Same length — already deduplicated, skip
+                    
+                    # Check if shorter is subsumed by longer
+                    subsumed = True
+                    for pos in range(shorter.sig_length):
+                        if shorter.mask[pos] == 0xFF:
+                            if longer.mask[pos] != 0xFF or shorter.data[pos] != longer.data[pos]:
+                                subsumed = False
+                                break
+                    
+                    if subsumed:
+                        related.add(i)
+                        related.add(j)
+            
+            if related:
+                # Assign the same group ID to all related sigs
+                group_id = next_group_id
+                next_group_id += 1
+                for idx in related:
+                    sigs[idx].subsumption_group = group_id
+    
+    def _merge_subsumed_results(self, raw_results: list[ScanResult]) -> list[ScanResult]:
+        """
+        Merge scan results at the same offset that are related by subsumption.
+        
+        When a shorter signature and a longer signature both match at the same
+        offset for the same library/object, merge them into a single result
+        with multiple VersionGroups and mark it as ambiguous.
+        """
+        from collections import defaultdict
+        
+        # Group by (offset, library, object_name)
+        groups: dict[tuple[int, str, str], list[ScanResult]] = defaultdict(list)
+        for r in raw_results:
+            groups[(r.offset, r.library, r.object_name)].append(r)
+        
+        merged: list[ScanResult] = []
+        
+        for key, results_at_offset in groups.items():
+            if len(results_at_offset) == 1:
+                merged.append(results_at_offset[0])
+                continue
+            
+            # Multiple results at same offset for same lib/obj — merge them
+            all_groups = []
+            # Use labels from the result with the longest signature (most complete)
+            best_labels = []
+            best_sig_len = 0
+            for r in results_at_offset:
+                all_groups.extend(r.version_groups)
+                r_max_len = max(vg.sig_length for vg in r.version_groups)
+                if r_max_len > best_sig_len:
+                    best_sig_len = r_max_len
+                    best_labels = r.labels
+            
+            # Sort groups: longest signature first (most specific)
+            all_groups.sort(key=lambda vg: vg.sig_length, reverse=True)
+            
+            merged.append(ScanResult(
+                offset=key[0],
+                library=key[1],
+                object_name=key[2],
+                version_groups=all_groups,
+                labels=best_labels if best_labels else results_at_offset[0].labels,
+                is_ambiguous=True,
+            ))
+        
+        # Re-sort by offset
+        merged.sort(key=lambda r: r.offset)
+        return merged
     
     def scan(self, binary_path: str, align: int = 4) -> list[ScanResult]:
         """
@@ -768,16 +907,23 @@ class ScanEngine:
                         offset=obj_start,
                         library=sig.library,
                         object_name=sig.object_name,
-                        versions=sig.versions,
-                        sig_length=sig.sig_length,
+                        version_groups=[VersionGroup(
+                            versions=list(sig.versions),
+                            sig_length=sig.sig_length,
+                        )],
                         labels=labels,
                     ))
+        
+        # Merge results that are related by subsumption (prefix signatures)
+        results = self._merge_subsumed_results(results)
         
         # Sort by offset
         results.sort(key=lambda r: r.offset)
         
         self._progress_pct = 1.0
-        self._progress_message = f"Scan complete: {len(results)} objects found"
+        ambiguous_count = sum(1 for r in results if r.is_ambiguous)
+        ambig_msg = f" ({ambiguous_count} ambiguous)" if ambiguous_count else ""
+        self._progress_message = f"Scan complete: {len(results)} objects found{ambig_msg}"
         
         return results
 
@@ -1541,7 +1687,11 @@ class PSYQApp:
         
         # Results
         if self.scan_results:
-            imgui.text(f"Found {len(self.scan_results)} objects in binary:")
+            ambiguous_count = sum(1 for r in self.scan_results if r.is_ambiguous)
+            summary = f"Found {len(self.scan_results)} objects in binary"
+            if ambiguous_count:
+                summary += f" ({ambiguous_count} ambiguous)"
+            imgui.text(summary)
             
             # Filter
             imgui.text("Filter:")
@@ -1562,9 +1712,12 @@ class PSYQApp:
                 or filter_lower in r.object_name.lower()
                 or any(filter_lower in v for v in r.versions)
                 or any(filter_lower in lbl.name.lower() for lbl in r.labels)
+                or (filter_lower == "ambiguous" and r.is_ambiguous)
             ]
             
             imgui.text(f"Showing {len(filtered)} of {len(self.scan_results)} results")
+            imgui.same_line()
+            imgui.text_colored("(filter 'ambiguous' to show only ambiguous matches)", 0.5, 0.5, 0.5, 1.0)
             
             imgui.begin_child("scan_results", 0, 0, border=True)
             
@@ -1593,18 +1746,48 @@ class PSYQApp:
                 imgui.set_column_width(2, 140)
                 imgui.set_column_width(3, 80)
                 
-                imgui.text(f"0x{result.offset:08X}")
+                # Offset — yellow if ambiguous
+                if result.is_ambiguous:
+                    imgui.text_colored(f"0x{result.offset:08X}", 1.0, 0.9, 0.3, 1.0)
+                else:
+                    imgui.text(f"0x{result.offset:08X}")
                 imgui.next_column()
                 imgui.text(result.library)
                 imgui.next_column()
                 imgui.text(result.object_name)
                 imgui.next_column()
-                imgui.text(f"0x{result.sig_length:X}")
+                
+                # Size column
+                if result.is_ambiguous:
+                    # Show range of sizes
+                    sizes = sorted(set(vg.sig_length for vg in result.version_groups))
+                    if len(sizes) > 1:
+                        imgui.text_colored(
+                            f"0x{sizes[0]:X}-0x{sizes[-1]:X}",
+                            1.0, 0.9, 0.3, 1.0
+                        )
+                    else:
+                        imgui.text(f"0x{sizes[0]:X}")
+                else:
+                    imgui.text(f"0x{result.sig_length:X}")
                 imgui.next_column()
                 
-                # Versions
-                version_str = ", ".join(result.versions)
-                imgui.text_wrapped(version_str)
+                # Versions column
+                if result.is_ambiguous:
+                    # Show ambiguity warning
+                    imgui.text_colored("[AMBIGUOUS - signature prefix overlap]", 1.0, 0.9, 0.3, 1.0)
+                    
+                    # Show each version group with its sig length
+                    for vg in result.version_groups:
+                        version_str = ", ".join(vg.versions)
+                        imgui.text_colored(
+                            f"  0x{vg.sig_length:X} bytes: {version_str}",
+                            0.9, 0.85, 0.5, 1.0
+                        )
+                else:
+                    # Normal: single version group
+                    version_str = ", ".join(result.versions)
+                    imgui.text_wrapped(version_str)
                 
                 # Show function labels in this object
                 func_labels = [l for l in result.labels if l.name.startswith("_") or l.offset == 0]
@@ -1661,10 +1844,12 @@ class PSYQApp:
                 len([l for l in r.labels if l.name.startswith("_") or l.offset == 0])
                 for r in self.scan_results
             )
+            ambiguous = sum(1 for r in self.scan_results if r.is_ambiguous)
             
+            ambig_msg = f", {ambiguous} ambiguous" if ambiguous else ""
             self.status_message = (
                 f"Scan complete: {unique_objects} objects found across "
-                f"{unique_libs} libraries, {total_funcs} functions identified"
+                f"{unique_libs} libraries, {total_funcs} functions identified{ambig_msg}"
             )
         except Exception as e:
             self.status_message = f"Scan failed: {e}"
@@ -1686,18 +1871,29 @@ class PSYQApp:
         
         try:
             with open(export_path, "w") as f:
-                f.write("Offset,Library,Object,Size,SDK Versions,Functions\n")
+                f.write("Offset,Library,Object,Size,Ambiguous,SDK Versions,Functions\n")
                 for r in self.scan_results:
                     func_labels = [l for l in r.labels if l.name.startswith("_") or l.offset == 0]
                     funcs_str = "; ".join(
                         f"{l.name} (0x{r.offset + l.offset:08X})" for l in func_labels
                     )
-                    versions_str = "; ".join(r.versions)
+                    
+                    if r.is_ambiguous:
+                        # Show each version group with its size
+                        version_parts = []
+                        for vg in r.version_groups:
+                            v_str = "+".join(vg.versions)
+                            version_parts.append(f"[0x{vg.sig_length:X}] {v_str}")
+                        versions_str = " | ".join(version_parts)
+                    else:
+                        versions_str = "; ".join(r.versions)
+                    
                     f.write(
                         f"0x{r.offset:08X},"
                         f"{r.library},"
                         f"{r.object_name},"
                         f"0x{r.sig_length:X},"
+                        f"{'YES' if r.is_ambiguous else 'NO'},"
                         f"\"{versions_str}\","
                         f"\"{funcs_str}\"\n"
                     )
