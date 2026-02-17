@@ -342,6 +342,42 @@ def signature_to_bytes(sig: str) -> tuple[bytes, bytes]:
     return data, mask
 
 
+def parse_sdk_version(version: str) -> tuple[int, int, int]:
+    """
+    Parse an SDK version string into a comparable tuple.
+    
+    PSY-Q versions are encoded as:
+    - 3 digits: X.Y.Z (e.g., "330" = 3.3.0, "470" = 4.7.0)
+    - 4 digits: X.Y.ZZ (e.g., "3611" = 3.6.11, "4010" = 4.0.10)
+    
+    Returns (major, minor, patch) tuple for proper sorting.
+    """
+    version = version.strip()
+    
+    if len(version) == 3:
+        # XYZ -> X.Y.Z
+        return (int(version[0]), int(version[1]), int(version[2]))
+    elif len(version) == 4:
+        # XYZZ -> X.Y.ZZ
+        return (int(version[0]), int(version[1]), int(version[2:4]))
+    elif len(version) == 5:
+        # XYZZZ or XXYZZ - assume X.Y.ZZZ or XX.Y.ZZ
+        # Try X.Y.ZZZ first (more likely for SDK versions)
+        return (int(version[0]), int(version[1]), int(version[2:5]))
+    else:
+        # Fallback: just use as integer for sorting
+        try:
+            return (int(version), 0, 0)
+        except ValueError:
+            return (0, 0, 0)
+
+
+def format_sdk_version(version: str) -> str:
+    """Format an SDK version for display (e.g., '470' -> '4.7.0')."""
+    major, minor, patch = parse_sdk_version(version)
+    return f"{major}.{minor}.{patch}"
+
+
 def compare_signatures(sig1: str, sig2: str) -> list[tuple[str, str, str]]:
     """
     Compare two signatures and return a diff.
@@ -1074,11 +1110,8 @@ class PSYQApp:
                 imgui.text(obj_name)
                 imgui.next_column()
                 
-                # Format version list nicely
-                if len(versions) <= 5:
-                    version_str = ", ".join(versions)
-                else:
-                    version_str = f"{versions[0]}..{versions[-1]} ({len(versions)} versions)"
+                # Always show all versions explicitly
+                version_str = ", ".join(versions)
                 imgui.text_wrapped(version_str)
                 
                 imgui.columns(1)
@@ -1130,8 +1163,8 @@ class PSYQApp:
         # Convert to result list and sort
         results = []
         for (library, obj_name), versions in location_versions.items():
-            # Sort versions numerically
-            versions.sort(key=lambda v: int(v))
+            # Sort versions by proper semantic versioning
+            versions.sort(key=parse_sdk_version)
             results.append((library, obj_name, versions))
         
         # Sort results by library, then object

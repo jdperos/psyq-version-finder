@@ -48,6 +48,20 @@ Since old compilers linked entire objects (not individual functions), you can ma
 
 This is generally more reliable than function matching since you're comparing the entire compiled object file.
 
+### Find Function
+
+Search for a function by name to see which library and object it lives in across all SDK versions.
+
+- Enter a function name (e.g., `_spu_init`) and optionally filter by library (this will significantly improve performance)
+- Results are collated: if a function lives in the same library/object across multiple versions, they're shown in one row
+- Useful for understanding when functions were added or moved between objects
+
+Example output for a function that moved between objects:
+| Library | Object | SDK Versions |
+|---------|--------|--------------|
+| LIBSPU.LIB | SPU.OBJ | 330, 340, 350, 360, 400 |
+| LIBSPU.LIB | SPU_NEW.OBJ | 410, 420, 430, 440, 446, 451, 460, 470 |
+
 ### Caching
 
 Signature JSONs are fetched from [lab313ru/psx_psyq_signatures](https://github.com/lab313ru/psx_psyq_signatures) and cached locally in `~/.cache/psyq_signatures/`. First run will be slower as it downloads what you need; subsequent runs are fast.
