@@ -43,7 +43,7 @@ GITHUB_RAW_BASE = "https://raw.githubusercontent.com/lab313ru/psx_psyq_signature
 CACHE_DIR = Path.home() / ".cache" / "psyq_signatures"
 
 # Known SDK versions (will be auto-discovered from GitHub)
-DEFAULT_SDK_VERSIONS = ["400", "401", "410", "411", "420", "430", "440", "446", "451", "460", "470"]
+DEFAULT_SDK_VERSIONS = ["260","300","330","340","350","3610","3611","370","400", "410", "420", "430", "440", "450", "460", "470"]
 
 
 # =============================================================================
