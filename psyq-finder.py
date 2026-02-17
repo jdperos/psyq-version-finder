@@ -1123,6 +1123,15 @@ class PSYQApp:
         self.scan_binary_fingerprint = ""
         self.fp_store = FalsePositiveStore()
         
+        # Tab 6: Library Explorer
+        self.explorer_version_idx = 0
+        self.explorer_lib_idx = 0
+        self.explorer_obj_idx = -1  # -1 = nothing selected
+        self.explorer_lib: Optional[Library] = None
+        self.explorer_filter_text = ""
+        self.explorer_filtered_objects: list[int] = []  # indices into explorer_lib.objects
+        self.explorer_hex_bytes_per_row = 16
+        
         # Status
         self.status_message = "Initializing..."
         self.loading = False
@@ -2135,6 +2144,272 @@ class PSYQApp:
         except Exception as e:
             self.status_message = f"Export failed: {e}"
     
+    def render_library_explorer_tab(self):
+        """Render the library explorer tab."""
+        if not self.versions:
+            imgui.text("No SDK versions available")
+            return
+        
+        # Top bar: version + library selectors
+        imgui.text("SDK Version:")
+        imgui.same_line()
+        imgui.set_next_item_width(100)
+        changed_ver, self.explorer_version_idx = imgui.combo(
+            "##explorer_version", self.explorer_version_idx, self.versions
+        )
+        
+        version = self.versions[self.explorer_version_idx]
+        libs = self._get_libraries_for_version(version)
+        
+        imgui.same_line()
+        imgui.text("Library:")
+        imgui.same_line()
+        imgui.set_next_item_width(200)
+        if libs:
+            changed_lib, self.explorer_lib_idx = imgui.combo(
+                "##explorer_lib", self.explorer_lib_idx, libs
+            )
+            self.explorer_lib_idx = min(self.explorer_lib_idx, len(libs) - 1)
+        else:
+            changed_lib = False
+            imgui.text_colored("(none available)", 0.5, 0.5, 0.5, 1.0)
+        
+        # Load library if selection changed
+        if changed_ver or changed_lib or self.explorer_lib is None:
+            if libs:
+                self.explorer_lib = self.sdk_manager.fetch_library(
+                    version, libs[self.explorer_lib_idx]
+                )
+                self.explorer_obj_idx = -1
+                self.explorer_filter_text = ""
+                self._update_explorer_filter()
+            else:
+                self.explorer_lib = None
+        
+        if not self.explorer_lib:
+            return
+        
+        lib = self.explorer_lib
+        
+        imgui.same_line()
+        imgui.text_colored(
+            f"({len(lib.objects)} objects)",
+            0.6, 0.6, 0.6, 1.0
+        )
+        
+        imgui.separator()
+        
+        # Split: object list on left, details on right
+        avail_width = imgui.get_content_region_available_width()
+        left_width = min(280, avail_width * 0.3)
+        
+        # === LEFT PANEL: Object list ===
+        imgui.begin_child("explorer_obj_list", left_width, 0, border=True)
+        
+        # Filter
+        imgui.text("Filter:")
+        imgui.same_line()
+        imgui.set_next_item_width(-1)
+        changed_filter, self.explorer_filter_text = imgui.input_text(
+            "##explorer_filter", self.explorer_filter_text, 256
+        )
+        if changed_filter:
+            self._update_explorer_filter()
+        
+        imgui.separator()
+        
+        filtered = self.explorer_filtered_objects
+        for list_pos, obj_idx in enumerate(filtered):
+            obj = lib.objects[obj_idx]
+            is_selected = (obj_idx == self.explorer_obj_idx)
+            
+            # Count real labels (skip loc_ / text_)
+            func_count = sum(
+                1 for l in obj.labels
+                if not l.name.startswith("loc_") and not l.name.startswith("text_")
+            )
+            sig_len = len(parse_signature(obj.sig))
+            
+            label = f"{obj.name}  ({func_count}f, 0x{sig_len:X}b)"
+            
+            clicked, _ = imgui.selectable(label, is_selected)
+            if clicked:
+                self.explorer_obj_idx = obj_idx
+        
+        imgui.end_child()
+        
+        imgui.same_line()
+        
+        # === RIGHT PANEL: Object details ===
+        imgui.begin_child("explorer_obj_detail", 0, 0, border=True)
+        
+        if self.explorer_obj_idx < 0 or self.explorer_obj_idx >= len(lib.objects):
+            imgui.text_colored("Select an object from the list", 0.5, 0.5, 0.5, 1.0)
+            imgui.end_child()
+            return
+        
+        obj = lib.objects[self.explorer_obj_idx]
+        parsed = parse_signature(obj.sig)
+        
+        # Header
+        imgui.text_colored(obj.name, 1.0, 1.0, 0.6, 1.0)
+        imgui.same_line()
+        imgui.text(f"- {lib.name} (SDK {version})")
+        imgui.text(f"Signature: 0x{len(parsed):X} bytes ({len(parsed)} bytes)")
+        
+        # Count wildcards
+        wildcards = sum(1 for _, w in parsed if w)
+        concrete = len(parsed) - wildcards
+        imgui.same_line()
+        imgui.text_colored(
+            f"  [{concrete} concrete, {wildcards} wildcard]",
+            0.6, 0.6, 0.6, 1.0
+        )
+        
+        imgui.separator()
+        
+        # --- Labels / Functions section ---
+        real_labels = [
+            l for l in obj.labels
+            if not l.name.startswith("loc_") and not l.name.startswith("text_")
+        ]
+        all_labels = obj.labels
+        
+        if imgui.collapsing_header(f"Functions ({len(real_labels)})##funcs", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            if real_labels:
+                imgui.columns(2, "label_cols")
+                imgui.set_column_width(0, 250)
+                imgui.text_colored("Name", 0.7, 0.7, 0.7, 1.0)
+                imgui.next_column()
+                imgui.text_colored("Offset", 0.7, 0.7, 0.7, 1.0)
+                imgui.columns(1)
+                imgui.separator()
+                
+                for lbl in real_labels:
+                    imgui.columns(2, f"lbl_{lbl.name}")
+                    imgui.set_column_width(0, 250)
+                    imgui.text_colored(lbl.name, 0.5, 0.9, 1.0, 1.0)
+                    imgui.next_column()
+                    imgui.text(f"0x{lbl.offset:X}")
+                    imgui.columns(1)
+            else:
+                imgui.text_colored("(no function labels)", 0.5, 0.5, 0.5, 1.0)
+        
+        # Internal labels (loc_, text_) in a collapsed section
+        internal_labels = [
+            l for l in obj.labels
+            if l.name.startswith("loc_") or l.name.startswith("text_")
+        ]
+        if internal_labels:
+            if imgui.collapsing_header(f"Internal Labels ({len(internal_labels)})##internal")[0]:
+                for lbl in internal_labels:
+                    imgui.text_colored(
+                        f"  {lbl.name}",
+                        0.5, 0.5, 0.5, 1.0
+                    )
+                    imgui.same_line()
+                    imgui.text(f"@ 0x{lbl.offset:X}")
+        
+        imgui.separator()
+        
+        # --- Hex view of signature ---
+        if imgui.collapsing_header("Signature Hex View##hexview", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            self._render_explorer_hex_view(parsed, all_labels)
+        
+        imgui.end_child()
+    
+    def _update_explorer_filter(self):
+        """Update the filtered object list based on filter text."""
+        if not self.explorer_lib:
+            self.explorer_filtered_objects = []
+            return
+        
+        filter_lower = self.explorer_filter_text.lower()
+        result = []
+        for i, obj in enumerate(self.explorer_lib.objects):
+            if not filter_lower:
+                result.append(i)
+                continue
+            # Match against object name or any label name
+            if filter_lower in obj.name.lower():
+                result.append(i)
+                continue
+            if any(filter_lower in l.name.lower() for l in obj.labels):
+                result.append(i)
+                continue
+        
+        self.explorer_filtered_objects = result
+    
+    def _render_explorer_hex_view(self, parsed: list[tuple[int, bool]], labels: list[Label]):
+        """Render a hex view of the signature with label markers."""
+        bpr = self.explorer_hex_bytes_per_row
+        
+        # Build a set of label offsets for quick lookup
+        label_map: dict[int, str] = {}
+        for lbl in labels:
+            if lbl.offset < len(parsed):
+                label_map[lbl.offset] = lbl.name
+        
+        imgui.begin_child("hex_view_scroll", 0, 0, border=False)
+        
+        for row_start in range(0, len(parsed), bpr):
+            row_end = min(row_start + bpr, len(parsed))
+            
+            # Check if any label starts in this row — show a marker line
+            for offset in range(row_start, row_end):
+                if offset in label_map:
+                    name = label_map[offset]
+                    # Display style based on label type
+                    if name.startswith("loc_") or name.startswith("text_"):
+                        imgui.text_colored(
+                            f"  ; --- {name} (0x{offset:X}) ---",
+                            0.4, 0.4, 0.4, 1.0
+                        )
+                    else:
+                        imgui.text_colored(
+                            f"  >>> {name} (0x{offset:X}) <<<",
+                            0.4, 1.0, 0.6, 1.0
+                        )
+            
+            # Offset column
+            imgui.text_colored(f"0x{row_start:04X}: ", 0.4, 0.4, 0.4, 1.0)
+            imgui.same_line()
+            
+            # Hex bytes
+            for i in range(row_start, row_end):
+                byte_val, is_wild = parsed[i]
+                hex = "??" if is_wild else f"{byte_val:02X}"
+                
+                if i in label_map:
+                    # First byte of a label — highlight
+                    imgui.text_colored(hex, 0.4, 1.0, 0.6, 1.0)
+                elif is_wild:
+                    imgui.text_colored(hex, 0.4, 0.4, 0.6, 1.0)
+                else:
+                    imgui.text_colored(hex, 0.8, 0.8, 0.8, 1.0)
+                
+                if i < row_end - 1:
+                    imgui.same_line()
+            
+            # ASCII column
+            imgui.same_line()
+            imgui.text_colored("  |", 0.3, 0.3, 0.3, 1.0)
+            imgui.same_line()
+            
+            ascii_str = ""
+            for i in range(row_start, row_end):
+                byte_val, is_wild = parsed[i]
+                if is_wild:
+                    ascii_str += "."
+                elif 32 <= byte_val <= 126:
+                    ascii_str += chr(byte_val)
+                else:
+                    ascii_str += "."
+            
+            imgui.text_colored(ascii_str, 0.5, 0.5, 0.5, 1.0)
+        
+        imgui.end_child()
+    
     def render_cache_tab(self):
         """Render the cache management tab."""
         imgui.text("Cache Management")
@@ -2207,6 +2482,10 @@ class PSYQApp:
             
             if imgui.begin_tab_item("Scan Binary")[0]:
                 self.render_scan_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Library Explorer")[0]:
+                self.render_library_explorer_tab()
                 imgui.end_tab_item()
             
             if imgui.begin_tab_item("Cache")[0]:
