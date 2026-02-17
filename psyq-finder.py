@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+"""
+PSY-Q SDK Version Identifier Tool
+==================================
+A tool for PS1 game decompilers to identify which PSY-Q SDK versions are used
+in their codebase by comparing function signatures.
+
+Features:
+- Fetches and caches PSY-Q signature JSONs from GitHub
+- Compares functions between SDK versions with visual diff
+- Matches binary data against signatures to identify versions
+
+Dependencies:
+    pip install imgui[glfw] glfw PyOpenGL requests
+
+Usage:
+    python psyq_version_finder.py
+"""
+
+import json
+import os
+import re
+import sys
+import hashlib
+from pathlib import Path
+from typing import Optional
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+
+import requests
+import glfw
+import OpenGL.GL as gl
+import imgui
+from imgui.integrations.glfw import GlfwRenderer
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+GITHUB_API_BASE = "https://api.github.com/repos/lab313ru/psx_psyq_signatures"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/lab313ru/psx_psyq_signatures/main"
+CACHE_DIR = Path.home() / ".cache" / "psyq_signatures"
+
+# Known SDK versions (will be auto-discovered from GitHub)
+DEFAULT_SDK_VERSIONS = ["400", "401", "410", "411", "420", "430", "440", "446", "451", "460", "470"]
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class Label:
+    name: str
+    offset: int
+
+
+@dataclass
+class ObjectEntry:
+    name: str
+    sig: str
+    labels: list[Label] = field(default_factory=list)
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> Optional["ObjectEntry"]:
+        """Parse an object entry, returning None if essential fields are missing."""
+        name = data.get("name", "")
+        sig = data.get("sig", "")
+        
+        # Skip entries without signatures (e.g., BSS-only objects like xbss entries)
+        # This is expected for some objects that only contain uninitialized data
+        if not sig:
+            return None
+        
+        labels = []
+        for l in data.get("labels", []):
+            if "name" in l and "offset" in l:
+                labels.append(Label(l["name"], l["offset"]))
+        
+        return cls(name=name, sig=sig, labels=labels)
+
+
+@dataclass
+class Library:
+    name: str
+    version: str
+    objects: list[ObjectEntry] = field(default_factory=list)
+    
+    def get_functions(self) -> dict[str, tuple[ObjectEntry, Label]]:
+        """Get all functions (labels at offset 0 or starting with _) mapped to their object."""
+        functions = {}
+        for obj in self.objects:
+            for label in obj.labels:
+                # Include functions at offset 0 or with underscore prefix (common convention)
+                if label.offset == 0 or label.name.startswith("_"):
+                    functions[label.name] = (obj, label)
+        return functions
+
+
+# =============================================================================
+# GitHub API & Caching
+# =============================================================================
+
+class SDKManager:
+    """Manages fetching and caching of PSY-Q SDK signature files."""
+    
+    def __init__(self, cache_dir: Path = CACHE_DIR):
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._versions_cache: list[str] = []
+        self._libraries_cache: dict[str, list[str]] = {}  # version -> library names
+        self._loaded_libraries: dict[str, Library] = {}  # "version/libname" -> Library
+        
+    def get_cache_path(self, version: str, library: str) -> Path:
+        """Get the cache file path for a specific library."""
+        return self.cache_dir / version / f"{library}.json"
+    
+    def is_cached(self, version: str, library: str) -> bool:
+        """Check if a library is already cached."""
+        return self.get_cache_path(version, library).exists()
+    
+    def discover_versions(self) -> list[str]:
+        """Discover available SDK versions from GitHub."""
+        if self._versions_cache:
+            return self._versions_cache
+            
+        # Check if we have a cached versions list
+        versions_file = self.cache_dir / "versions.json"
+        if versions_file.exists():
+            try:
+                with open(versions_file) as f:
+                    self._versions_cache = json.load(f)
+                return self._versions_cache
+            except:
+                pass
+        
+        # Fetch from GitHub API
+        try:
+            response = requests.get(f"{GITHUB_API_BASE}/contents", timeout=10)
+            response.raise_for_status()
+            contents = response.json()
+            
+            versions = []
+            for item in contents:
+                if item["type"] == "dir" and item["name"].isdigit():
+                    versions.append(item["name"])
+            
+            versions.sort(key=lambda x: int(x))
+            self._versions_cache = versions
+            
+            # Cache the versions list
+            with open(versions_file, "w") as f:
+                json.dump(versions, f)
+                
+            return versions
+        except Exception as e:
+            print(f"Failed to discover versions: {e}")
+            return DEFAULT_SDK_VERSIONS
+    
+    def discover_libraries(self, version: str) -> list[str]:
+        """Discover available libraries for a specific SDK version."""
+        if version in self._libraries_cache:
+            return self._libraries_cache[version]
+            
+        # Check cached list
+        libs_file = self.cache_dir / version / "libraries.json"
+        if libs_file.exists():
+            try:
+                with open(libs_file) as f:
+                    self._libraries_cache[version] = json.load(f)
+                return self._libraries_cache[version]
+            except:
+                pass
+        
+        # Fetch from GitHub API
+        try:
+            response = requests.get(f"{GITHUB_API_BASE}/contents/{version}", timeout=10)
+            response.raise_for_status()
+            contents = response.json()
+            
+            libraries = []
+            for item in contents:
+                if item["type"] == "file" and item["name"].endswith(".LIB.json"):
+                    # Extract library name (e.g., "LIBSPU.LIB.json" -> "LIBSPU.LIB")
+                    lib_name = item["name"][:-5]  # Remove .json
+                    libraries.append(lib_name)
+            
+            libraries.sort()
+            self._libraries_cache[version] = libraries
+            
+            # Cache the libraries list
+            libs_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(libs_file, "w") as f:
+                json.dump(libraries, f)
+                
+            return libraries
+        except Exception as e:
+            print(f"Failed to discover libraries for {version}: {e}")
+            return []
+    
+    def fetch_library(self, version: str, library: str, force_refresh: bool = False) -> Optional[Library]:
+        """Fetch a library, using cache if available."""
+        cache_key = f"{version}/{library}"
+        
+        # Check memory cache
+        if cache_key in self._loaded_libraries and not force_refresh:
+            return self._loaded_libraries[cache_key]
+        
+        cache_path = self.get_cache_path(version, library)
+        
+        # Check disk cache
+        if cache_path.exists() and not force_refresh:
+            try:
+                with open(cache_path) as f:
+                    data = json.load(f)
+                lib = self._parse_library(data, library, version)
+                self._loaded_libraries[cache_key] = lib
+                return lib
+            except json.JSONDecodeError as e:
+                print(f"Cache corrupted for {cache_key}, re-fetching...")
+            except Exception as e:
+                print(f"Failed to load {cache_key}: {type(e).__name__}: {e}")
+        
+        # Fetch from GitHub
+        try:
+            url = f"{GITHUB_RAW_BASE}/{version}/{library}.json"
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Cache to disk
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(data, f)
+            
+            lib = self._parse_library(data, library, version)
+            self._loaded_libraries[cache_key] = lib
+            return lib
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Network error fetching {cache_key}: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON from {cache_key}: {e}")
+            return None
+        except Exception as e:
+            print(f"Error loading {cache_key}: {type(e).__name__}: {e}")
+            return None
+    
+    def _parse_library(self, data, name: str, version: str) -> Library:
+        """Parse JSON data into a Library object."""
+        objects = []
+        
+        # Handle different possible JSON structures
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # Maybe it's wrapped in a key?
+            if "objects" in data:
+                items = data["objects"]
+            elif "entries" in data:
+                items = data["entries"]
+            else:
+                # Try to use all dict values that look like objects
+                items = [v for v in data.values() if isinstance(v, dict)]
+        else:
+            print(f"Unexpected data type for {version}/{name}: {type(data)}")
+            return Library(name=name, version=version, objects=[])
+        
+        for obj_data in items:
+            if not isinstance(obj_data, dict):
+                continue
+            obj = ObjectEntry.from_dict(obj_data)
+            if obj is not None:
+                objects.append(obj)
+        
+        return Library(name=name, version=version, objects=objects)
+    
+    def clear_cache(self):
+        """Clear all cached files."""
+        import shutil
+        if self.cache_dir.exists():
+            shutil.rmtree(self.cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._versions_cache = []
+        self._libraries_cache = {}
+        self._loaded_libraries = {}
+
+
+# =============================================================================
+# Signature Processing
+# =============================================================================
+
+def parse_signature(sig: str) -> list[tuple[int, bool]]:
+    """
+    Parse a signature string into a list of (byte_value, is_wildcard) tuples.
+    Wildcards are marked as ?? in the signature.
+    """
+    # Clean up the signature - remove comments and extra whitespace
+    sig = re.sub(r'/\*.*?\*/', '', sig)  # Remove /* ... */ comments
+    sig = sig.strip()
+    
+    bytes_list = []
+    tokens = sig.split()
+    
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if token == "??":
+            bytes_list.append((0, True))  # Wildcard
+        else:
+            try:
+                byte_val = int(token, 16)
+                bytes_list.append((byte_val, False))
+            except ValueError:
+                continue  # Skip invalid tokens
+    
+    return bytes_list
+
+
+def signature_to_bytes(sig: str) -> tuple[bytes, bytes]:
+    """
+    Convert a signature to bytes and a mask.
+    Returns (data, mask) where mask has 0xFF for concrete bytes and 0x00 for wildcards.
+    """
+    parsed = parse_signature(sig)
+    data = bytes(b for b, _ in parsed)
+    mask = bytes(0x00 if is_wild else 0xFF for _, is_wild in parsed)
+    return data, mask
+
+
+def compare_signatures(sig1: str, sig2: str) -> list[tuple[str, str, str]]:
+    """
+    Compare two signatures and return a diff.
+    Returns list of (type, bytes1, bytes2) where type is 'same', 'diff', or 'wildcard'.
+    """
+    parsed1 = parse_signature(sig1)
+    parsed2 = parse_signature(sig2)
+    
+    result = []
+    max_len = max(len(parsed1), len(parsed2))
+    
+    for i in range(max_len):
+        if i >= len(parsed1):
+            b1, w1 = 0, True
+        else:
+            b1, w1 = parsed1[i]
+            
+        if i >= len(parsed2):
+            b2, w2 = 0, True
+        else:
+            b2, w2 = parsed2[i]
+        
+        str1 = "??" if w1 else f"{b1:02X}"
+        str2 = "??" if w2 else f"{b2:02X}"
+        
+        if w1 and w2:
+            diff_type = "wildcard"
+        elif w1 or w2:
+            diff_type = "diff"
+        elif b1 == b2:
+            diff_type = "same"
+        else:
+            diff_type = "diff"
+            
+        result.append((diff_type, str1, str2))
+    
+    return result
+
+
+def match_binary_to_signature(binary_data: bytes, sig: str) -> bool:
+    """Check if binary data matches a signature pattern."""
+    parsed = parse_signature(sig)
+    
+    if len(binary_data) < len(parsed):
+        return False
+    
+    for i, (expected, is_wildcard) in enumerate(parsed):
+        if is_wildcard:
+            continue
+        if binary_data[i] != expected:
+            return False
+    
+    return True
+
+
+def find_function_in_binary(binary_path: str, offset: int, function_name: str, 
+                            sdk_manager: SDKManager) -> list[tuple[str, str, float]]:
+    """
+    Find which SDK versions match a function at a given offset.
+    Returns list of (version, library, match_percentage) tuples.
+    """
+    try:
+        with open(binary_path, "rb") as f:
+            f.seek(offset)
+            # Read a reasonable chunk for matching
+            binary_data = f.read(0x1000)
+    except Exception as e:
+        print(f"Failed to read binary: {e}")
+        return []
+    
+    matches = []
+    versions = sdk_manager.discover_versions()
+    
+    for version in versions:
+        libraries = sdk_manager.discover_libraries(version)
+        for lib_name in libraries:
+            lib = sdk_manager.fetch_library(version, lib_name)
+            if not lib:
+                continue
+                
+            functions = lib.get_functions()
+            if function_name not in functions:
+                continue
+            
+            obj, label = functions[function_name]
+            
+            # Calculate how much of the signature matches
+            parsed = parse_signature(obj.sig)
+            if not parsed:
+                continue
+                
+            # Adjust for label offset within the object
+            sig_start = label.offset
+            
+            matching_bytes = 0
+            total_concrete_bytes = 0
+            
+            for i, (expected, is_wildcard) in enumerate(parsed[sig_start:]):
+                if i >= len(binary_data):
+                    break
+                    
+                if is_wildcard:
+                    continue
+                    
+                total_concrete_bytes += 1
+                if binary_data[i] == expected:
+                    matching_bytes += 1
+            
+            if total_concrete_bytes > 0:
+                match_pct = (matching_bytes / total_concrete_bytes) * 100
+                if match_pct > 50:  # Only include decent matches
+                    matches.append((version, lib_name, match_pct))
+    
+    # Sort by match percentage descending
+    matches.sort(key=lambda x: x[2], reverse=True)
+    return matches
+
+
+# =============================================================================
+# ImGui Application
+# =============================================================================
+
+class PSYQApp:
+    """Main application class with ImGui interface."""
+    
+    def __init__(self):
+        self.sdk_manager = SDKManager()
+        
+        # UI State
+        self.versions: list[str] = []
+        self.libraries: dict[str, list[str]] = {}
+        
+        # Tab 1: Compare Functions
+        self.compare_version1_idx = 0
+        self.compare_version2_idx = 0
+        self.compare_lib1_idx = 0
+        self.compare_lib2_idx = 0
+        self.compare_func_idx = 0
+        self.compare_result: list[tuple[str, str, str]] = []
+        self.compare_functions: list[str] = []
+        self.compare_lib1: Optional[Library] = None
+        self.compare_lib2: Optional[Library] = None
+        
+        # Tab 2: Match Binary
+        self.binary_path = ""
+        self.binary_offset_str = "0"
+        self.function_name = ""
+        self.match_results: list[tuple[str, str, float]] = []
+        self.matching = False
+        
+        # Status
+        self.status_message = "Initializing..."
+        self.loading = False
+        
+        # Initialize
+        self._init_versions()
+    
+    def _init_versions(self):
+        """Initialize available versions."""
+        self.status_message = "Discovering SDK versions..."
+        self.versions = self.sdk_manager.discover_versions()
+        if self.versions:
+            self.status_message = f"Found {len(self.versions)} SDK versions"
+        else:
+            self.status_message = "No SDK versions found - check internet connection"
+    
+    def _get_libraries_for_version(self, version: str) -> list[str]:
+        """Get libraries for a version, discovering if needed."""
+        if version not in self.libraries:
+            self.libraries[version] = self.sdk_manager.discover_libraries(version)
+        return self.libraries[version]
+    
+    def _load_compare_libraries(self):
+        """Load libraries for comparison."""
+        if not self.versions:
+            return
+            
+        v1 = self.versions[self.compare_version1_idx]
+        v2 = self.versions[self.compare_version2_idx]
+        
+        libs1 = self._get_libraries_for_version(v1)
+        libs2 = self._get_libraries_for_version(v2)
+        
+        if not libs1 or not libs2:
+            return
+        
+        # Clamp indices
+        self.compare_lib1_idx = min(self.compare_lib1_idx, len(libs1) - 1)
+        self.compare_lib2_idx = min(self.compare_lib2_idx, len(libs2) - 1)
+        
+        lib1_name = libs1[self.compare_lib1_idx]
+        lib2_name = libs2[self.compare_lib2_idx]
+        
+        self.compare_lib1 = self.sdk_manager.fetch_library(v1, lib1_name)
+        self.compare_lib2 = self.sdk_manager.fetch_library(v2, lib2_name)
+        
+        # Find common functions
+        if self.compare_lib1 and self.compare_lib2:
+            funcs1 = set(self.compare_lib1.get_functions().keys())
+            funcs2 = set(self.compare_lib2.get_functions().keys())
+            self.compare_functions = sorted(funcs1 & funcs2)
+            self.compare_func_idx = min(self.compare_func_idx, max(0, len(self.compare_functions) - 1))
+    
+    def _do_compare(self):
+        """Perform the signature comparison."""
+        if not self.compare_lib1 or not self.compare_lib2:
+            return
+        if not self.compare_functions:
+            return
+        
+        func_name = self.compare_functions[self.compare_func_idx]
+        funcs1 = self.compare_lib1.get_functions()
+        funcs2 = self.compare_lib2.get_functions()
+        
+        if func_name not in funcs1 or func_name not in funcs2:
+            return
+        
+        obj1, label1 = funcs1[func_name]
+        obj2, label2 = funcs2[func_name]
+        
+        self.compare_result = compare_signatures(obj1.sig, obj2.sig)
+        self.status_message = f"Compared {func_name}: {len(self.compare_result)} bytes"
+    
+    def render_compare_tab(self):
+        """Render the function comparison tab."""
+        if not self.versions:
+            imgui.text("No SDK versions available")
+            return
+        
+        imgui.text("Compare function signatures between SDK versions")
+        imgui.separator()
+        
+        # Version selectors
+        libs1 = self._get_libraries_for_version(self.versions[self.compare_version1_idx]) if self.versions else []
+        libs2 = self._get_libraries_for_version(self.versions[self.compare_version2_idx]) if self.versions else []
+        
+        imgui.columns(2, "version_columns")
+        
+        # Left column - Version 1
+        imgui.text("Version 1")
+        changed1, self.compare_version1_idx = imgui.combo(
+            "SDK##1", self.compare_version1_idx, self.versions
+        )
+        
+        if libs1:
+            changed_lib1, self.compare_lib1_idx = imgui.combo(
+                "Library##1", self.compare_lib1_idx, libs1
+            )
+            if changed1 or changed_lib1:
+                self._load_compare_libraries()
+        
+        imgui.next_column()
+        
+        # Right column - Version 2
+        imgui.text("Version 2")
+        changed2, self.compare_version2_idx = imgui.combo(
+            "SDK##2", self.compare_version2_idx, self.versions
+        )
+        
+        if libs2:
+            changed_lib2, self.compare_lib2_idx = imgui.combo(
+                "Library##2", self.compare_lib2_idx, libs2
+            )
+            if changed2 or changed_lib2:
+                self._load_compare_libraries()
+        
+        imgui.columns(1)
+        imgui.separator()
+        
+        # Function selector
+        if self.compare_functions:
+            _, self.compare_func_idx = imgui.combo(
+                "Function", self.compare_func_idx, self.compare_functions
+            )
+            
+            if imgui.button("Compare", width=120):
+                self._do_compare()
+        else:
+            imgui.text("No common functions found between selected libraries")
+        
+        imgui.separator()
+        
+        # Results display
+        if self.compare_result:
+            self._render_diff_view()
+    
+    def _render_diff_view(self):
+        """Render the signature diff view."""
+        imgui.begin_child("diff_view", 0, 0, border=True)
+        
+        # Header
+        imgui.columns(3, "diff_header")
+        imgui.text("Offset")
+        imgui.next_column()
+        imgui.text(f"Version {self.versions[self.compare_version1_idx]}")
+        imgui.next_column()
+        imgui.text(f"Version {self.versions[self.compare_version2_idx]}")
+        imgui.columns(1)
+        imgui.separator()
+        
+        # Display in rows of 16 bytes
+        bytes_per_row = 16
+        
+        for row_start in range(0, len(self.compare_result), bytes_per_row):
+            row_end = min(row_start + bytes_per_row, len(self.compare_result))
+            row_data = self.compare_result[row_start:row_end]
+            
+            imgui.columns(3, f"diff_row_{row_start}")
+            
+            # Offset
+            imgui.text(f"0x{row_start:04X}")
+            imgui.next_column()
+            
+            # Version 1 bytes
+            for diff_type, b1, b2 in row_data:
+                if diff_type == "same":
+                    imgui.text_colored(b1, 0.7, 0.7, 0.7, 1.0)
+                elif diff_type == "wildcard":
+                    imgui.text_colored(b1, 0.5, 0.5, 0.8, 1.0)
+                else:  # diff
+                    imgui.text_colored(b1, 1.0, 0.3, 0.3, 1.0)
+                imgui.same_line()
+            imgui.next_column()
+            
+            # Version 2 bytes
+            for diff_type, b1, b2 in row_data:
+                if diff_type == "same":
+                    imgui.text_colored(b2, 0.7, 0.7, 0.7, 1.0)
+                elif diff_type == "wildcard":
+                    imgui.text_colored(b2, 0.5, 0.5, 0.8, 1.0)
+                else:  # diff
+                    imgui.text_colored(b2, 0.3, 1.0, 0.3, 1.0)
+                imgui.same_line()
+            
+            imgui.columns(1)
+        
+        imgui.end_child()
+        
+        # Legend
+        imgui.text("Legend: ")
+        imgui.same_line()
+        imgui.text_colored("Same", 0.7, 0.7, 0.7, 1.0)
+        imgui.same_line()
+        imgui.text_colored("Wildcard", 0.5, 0.5, 0.8, 1.0)
+        imgui.same_line()
+        imgui.text_colored("Different", 1.0, 0.5, 0.3, 1.0)
+    
+    def render_match_tab(self):
+        """Render the binary matching tab."""
+        imgui.text("Match a function in your binary against SDK signatures")
+        imgui.separator()
+        
+        # Binary path
+        imgui.text("Binary File:")
+        changed, self.binary_path = imgui.input_text("##binary_path", self.binary_path, 512)
+        imgui.same_line()
+        if imgui.button("Browse..."):
+            # Note: In a real app, you'd use a file dialog here
+            self.status_message = "File dialog not implemented - enter path manually"
+        
+        # Offset
+        imgui.text("Function Offset (hex):")
+        _, self.binary_offset_str = imgui.input_text("##offset", self.binary_offset_str, 32)
+        
+        # Function name
+        imgui.text("Function Name:")
+        _, self.function_name = imgui.input_text("##func_name", self.function_name, 256)
+        
+        imgui.separator()
+        
+        if imgui.button("Find Matching Versions", width=200):
+            self._do_match()
+        
+        imgui.separator()
+        
+        # Results
+        if self.match_results:
+            imgui.text(f"Found {len(self.match_results)} potential matches:")
+            
+            imgui.begin_child("match_results", 0, 200, border=True)
+            
+            imgui.columns(3, "match_columns")
+            imgui.text("SDK Version")
+            imgui.next_column()
+            imgui.text("Library")
+            imgui.next_column()
+            imgui.text("Match %")
+            imgui.columns(1)
+            imgui.separator()
+            
+            for version, lib_name, match_pct in self.match_results:
+                imgui.columns(3, f"match_{version}_{lib_name}")
+                imgui.text(version)
+                imgui.next_column()
+                imgui.text(lib_name)
+                imgui.next_column()
+                
+                # Color based on match percentage
+                if match_pct >= 95:
+                    imgui.text_colored(f"{match_pct:.1f}%", 0.3, 1.0, 0.3, 1.0)
+                elif match_pct >= 80:
+                    imgui.text_colored(f"{match_pct:.1f}%", 1.0, 1.0, 0.3, 1.0)
+                else:
+                    imgui.text_colored(f"{match_pct:.1f}%", 1.0, 0.5, 0.3, 1.0)
+                
+                imgui.columns(1)
+            
+            imgui.end_child()
+        elif self.matching:
+            imgui.text("Searching...")
+    
+    def _do_match(self):
+        """Perform binary matching."""
+        if not self.binary_path or not self.function_name:
+            self.status_message = "Please enter binary path and function name"
+            return
+        
+        try:
+            offset = int(self.binary_offset_str, 16) if self.binary_offset_str.startswith("0x") or any(c in self.binary_offset_str.lower() for c in "abcdef") else int(self.binary_offset_str, 16)
+        except ValueError:
+            try:
+                offset = int(self.binary_offset_str)
+            except ValueError:
+                self.status_message = "Invalid offset format"
+                return
+        
+        if not os.path.exists(self.binary_path):
+            self.status_message = f"File not found: {self.binary_path}"
+            return
+        
+        self.matching = True
+        self.status_message = f"Searching for {self.function_name} at offset 0x{offset:X}..."
+        
+        self.match_results = find_function_in_binary(
+            self.binary_path, offset, self.function_name, self.sdk_manager
+        )
+        
+        self.matching = False
+        if self.match_results:
+            self.status_message = f"Found {len(self.match_results)} potential matches"
+        else:
+            self.status_message = "No matches found"
+    
+    def render_cache_tab(self):
+        """Render the cache management tab."""
+        imgui.text("Cache Management")
+        imgui.separator()
+        
+        cache_size = sum(f.stat().st_size for f in CACHE_DIR.rglob("*") if f.is_file()) if CACHE_DIR.exists() else 0
+        imgui.text(f"Cache location: {CACHE_DIR}")
+        imgui.text(f"Cache size: {cache_size / 1024:.1f} KB")
+        
+        imgui.separator()
+        
+        if imgui.button("Clear Cache", width=120):
+            self.sdk_manager.clear_cache()
+            self.versions = []
+            self.libraries = {}
+            self._init_versions()
+            self.status_message = "Cache cleared"
+        
+        imgui.same_line()
+        if imgui.button("Refresh Versions", width=120):
+            self._init_versions()
+    
+    def render(self):
+        """Render the main application UI."""
+        # Main window
+        imgui.set_next_window_position(10, 10, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_size(900, 600, imgui.FIRST_USE_EVER)
+        
+        imgui.begin("PSY-Q SDK Version Finder", flags=imgui.WINDOW_MENU_BAR)
+        
+        # Menu bar
+        if imgui.begin_menu_bar():
+            if imgui.begin_menu("File"):
+                if imgui.menu_item("Clear Cache")[0]:
+                    self.sdk_manager.clear_cache()
+                    self._init_versions()
+                if imgui.menu_item("Exit")[0]:
+                    return False
+                imgui.end_menu()
+            if imgui.begin_menu("Help"):
+                if imgui.menu_item("About")[0]:
+                    self.status_message = "PSY-Q SDK Version Finder - For PS1 Decompilation"
+                imgui.end_menu()
+            imgui.end_menu_bar()
+        
+        # Tabs
+        if imgui.begin_tab_bar("main_tabs"):
+            if imgui.begin_tab_item("Compare Functions")[0]:
+                self.render_compare_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Match Binary")[0]:
+                self.render_match_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Cache")[0]:
+                self.render_cache_tab()
+                imgui.end_tab_item()
+            
+            imgui.end_tab_bar()
+        
+        # Status bar
+        imgui.separator()
+        imgui.text(f"Status: {self.status_message}")
+        
+        imgui.end()
+        
+        return True
+
+
+def main():
+    """Main entry point."""
+    # Initialize GLFW
+    if not glfw.init():
+        print("Failed to initialize GLFW")
+        sys.exit(1)
+    
+    # Create window
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+    glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, gl.GL_TRUE)
+    
+    window = glfw.create_window(1024, 768, "PSY-Q SDK Version Finder", None, None)
+    if not window:
+        glfw.terminate()
+        print("Failed to create window")
+        sys.exit(1)
+    
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)  # Enable vsync
+    
+    # Initialize ImGui
+    imgui.create_context()
+    impl = GlfwRenderer(window)
+    
+    # Create application
+    app = PSYQApp()
+    
+    # Main loop
+    while not glfw.window_should_close(window):
+        glfw.poll_events()
+        impl.process_inputs()
+        
+        imgui.new_frame()
+        
+        if not app.render():
+            break
+        
+        # Rendering
+        gl.glClearColor(0.1, 0.1, 0.1, 1.0)
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+        
+        imgui.render()
+        impl.render(imgui.get_draw_data())
+        
+        glfw.swap_buffers(window)
+    
+    # Cleanup
+    impl.shutdown()
+    glfw.terminate()
+
+
+if __name__ == "__main__":
+    main()
