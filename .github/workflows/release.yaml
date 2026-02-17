@@ -1,14 +1,9 @@
-name: Build & Release (Auto Build)
+name: Release (Tagged Version)
 
 on:
   push:
-    branches: [ "master" ]
-    paths:
-      - "psyq-finder.py"
-      - "requirements.txt"
-      - "resources/**"
-      - ".github/workflows/release.yml"
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -49,12 +44,12 @@ jobs:
           $exe = "dist\Psy-Q SDK Version Finder.exe"
           if (!(Test-Path $exe)) { throw "EXE not found at $exe" }
 
-      - name: Create GitHub Release
+      - name: Create Release
         uses: ncipollo/release-action@v1
         with:
-          tag: build-${{ github.run_number }}-${{ github.sha }}
-          name: Build ${{ github.run_number }}
-          prerelease: true
+          tag: ${{ github.ref_name }}
+          name: Psy-Q SDK Version Finder ${{ github.ref_name }}
+          draft: false
+          prerelease: false
           artifacts: dist/*.exe
           token: ${{ secrets.GITHUB_TOKEN }}
-

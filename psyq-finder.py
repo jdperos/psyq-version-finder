@@ -2445,8 +2445,6 @@ class PSYQApp:
         imgui.set_next_window_position(10, 10, imgui.FIRST_USE_EVER)
         imgui.set_next_window_size(900, 600, imgui.FIRST_USE_EVER)
         
-        imgui.begin("PSY-Q SDK Version Finder", flags=imgui.WINDOW_MENU_BAR)
-        
         # Menu bar
         if imgui.begin_menu_bar():
             if imgui.begin_menu("File"):
@@ -2498,8 +2496,6 @@ class PSYQApp:
         imgui.separator()
         imgui.text(f"Status: {self.status_message}")
         
-        imgui.end()
-        
         return True
 
 
@@ -2509,48 +2505,70 @@ def main():
     if not glfw.init():
         print("Failed to initialize GLFW")
         sys.exit(1)
-    
+
     # Create window
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
     glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, gl.GL_TRUE)
-    
+
     window = glfw.create_window(1024, 768, "PSY-Q SDK Version Finder", None, None)
     if not window:
         glfw.terminate()
         print("Failed to create window")
         sys.exit(1)
-    
+
     glfw.make_context_current(window)
     glfw.swap_interval(1)  # Enable vsync
-    
+
     # Initialize ImGui
     imgui.create_context()
     impl = GlfwRenderer(window)
-    
+
     # Create application
     app = PSYQApp()
-    
+
     # Main loop
     while not glfw.window_should_close(window):
         glfw.poll_events()
         impl.process_inputs()
-        
+
         imgui.new_frame()
-        
+
+        # --- Root fullscreen "app surface" (no floating window chrome) ---
+        # Match ImGui to the current GLFW window size every frame
+        w, h = glfw.get_framebuffer_size(window)  # framebuffer is safest for GL
+        imgui.set_next_window_position(0.0, 0.0)
+        imgui.set_next_window_size(float(w), float(h))
+
+        root_flags = (
+            imgui.WINDOW_NO_TITLE_BAR |
+            imgui.WINDOW_NO_RESIZE |
+            imgui.WINDOW_NO_MOVE |
+            imgui.WINDOW_NO_COLLAPSE |
+            imgui.WINDOW_NO_SAVED_SETTINGS |
+            imgui.WINDOW_NO_BRING_TO_FRONT_ON_FOCUS |
+            imgui.WINDOW_NO_NAV_FOCUS
+        )
+
+        imgui.push_style_var(imgui.STYLE_WINDOW_PADDING, (0.0, 0.0))
+        imgui.begin("##Root", True, root_flags)
+        imgui.pop_style_var()
+
         if not app.render():
+            imgui.end()
             break
-        
-        # Rendering
+
+        imgui.end()
+
         gl.glClearColor(0.1, 0.1, 0.1, 1.0)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-        
+
         imgui.render()
         impl.render(imgui.get_draw_data())
-        
+
         glfw.swap_buffers(window)
-    
+
     # Cleanup
     impl.shutdown()
     glfw.terminate()
