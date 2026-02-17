@@ -88,13 +88,19 @@ class Library:
     objects: list[ObjectEntry] = field(default_factory=list)
     
     def get_functions(self) -> dict[str, tuple[ObjectEntry, Label]]:
-        """Get all functions (labels at offset 0 or starting with _) mapped to their object."""
-        functions = {}
+        """Get all real function labels mapped to their object."""
+        functions: dict[str, tuple[ObjectEntry, Label]] = {}
+    
         for obj in self.objects:
             for label in obj.labels:
-                # Include functions at offset 0 or with underscore prefix (common convention)
-                if label.offset == 0 or label.name.startswith("_"):
-                    functions[label.name] = (obj, label)
+                name = label.name
+    
+                # Skip assembler-generated labels
+                if name.startswith("loc_") or name.startswith("text_"):
+                    continue
+    
+                functions[name] = (obj, label)
+    
         return functions
 
 
@@ -278,11 +284,31 @@ class SDKManager:
         return Library(name=name, version=version, objects=objects)
     
     def clear_cache(self):
-        """Clear all cached files."""
+        """Clear all cached signature files, preserving false positive data."""
         import shutil
+        fp_file = self.cache_dir / FalsePositiveStore.FILENAME
+        fp_data = None
+        
+        # Preserve false positive data
+        if fp_file.exists():
+            try:
+                with open(fp_file) as f:
+                    fp_data = f.read()
+            except Exception:
+                pass
+        
         if self.cache_dir.exists():
             shutil.rmtree(self.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Restore false positive data
+        if fp_data is not None:
+            try:
+                with open(fp_file, "w") as f:
+                    f.write(fp_data)
+            except Exception:
+                pass
+        
         self._versions_cache = []
         self._libraries_cache = {}
         self._loaded_libraries = {}
@@ -297,6 +323,103 @@ class SDKManager:
             all_libs.update(libs)
         
         return sorted(all_libs)
+
+
+# =============================================================================
+# False Positive Store
+# =============================================================================
+
+class FalsePositiveStore:
+    """
+    Persists false positive dismissals for scan results.
+    
+    Keyed by a binary fingerprint (fast hash of size + head + tail) so
+    dismissals are tied to a specific binary and survive across sessions.
+    Each entry is (offset, library, object_name).
+    """
+    
+    FILENAME = "false_positives.json"
+    
+    def __init__(self, cache_dir: Path = CACHE_DIR):
+        self.cache_dir = cache_dir
+        self._store: dict[str, list[dict]] = {}  # fingerprint -> [{offset, library, object}]
+        self._load()
+    
+    def _store_path(self) -> Path:
+        return self.cache_dir / self.FILENAME
+    
+    def _load(self) -> None:
+        path = self._store_path()
+        if path.exists():
+            try:
+                with open(path) as f:
+                    self._store = json.load(f)
+            except Exception:
+                self._store = {}
+    
+    def _save(self) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._store_path(), "w") as f:
+            json.dump(self._store, f, indent=2)
+    
+    @staticmethod
+    def fingerprint(binary_path: str) -> str:
+        """
+        Fast fingerprint of a binary: hash of (size, first 4KB, last 4KB).
+        Unique enough for our purposes and instant even on large files.
+        """
+        try:
+            file_size = os.path.getsize(binary_path)
+            h = hashlib.sha256()
+            h.update(str(file_size).encode())
+            with open(binary_path, "rb") as f:
+                head = f.read(4096)
+                h.update(head)
+                if file_size > 4096:
+                    f.seek(max(0, file_size - 4096))
+                    tail = f.read(4096)
+                    h.update(tail)
+            return h.hexdigest()[:16]
+        except Exception:
+            # Fallback: use filename + size
+            return hashlib.sha256(binary_path.encode()).hexdigest()[:16]
+    
+    def is_false_positive(self, fingerprint: str, offset: int, library: str, object_name: str) -> bool:
+        entries = self._store.get(fingerprint, [])
+        return any(
+            e["offset"] == offset and e["library"] == library and e["object"] == object_name
+            for e in entries
+        )
+    
+    def mark(self, fingerprint: str, offset: int, library: str, object_name: str) -> None:
+        if fingerprint not in self._store:
+            self._store[fingerprint] = []
+        # Don't double-add
+        if not self.is_false_positive(fingerprint, offset, library, object_name):
+            self._store[fingerprint].append({
+                "offset": offset,
+                "library": library,
+                "object": object_name,
+            })
+            self._save()
+    
+    def unmark(self, fingerprint: str, offset: int, library: str, object_name: str) -> None:
+        entries = self._store.get(fingerprint, [])
+        self._store[fingerprint] = [
+            e for e in entries
+            if not (e["offset"] == offset and e["library"] == library and e["object"] == object_name)
+        ]
+        if not self._store[fingerprint]:
+            del self._store[fingerprint]
+        self._save()
+    
+    def get_count(self, fingerprint: str) -> int:
+        return len(self._store.get(fingerprint, []))
+    
+    def clear_for_binary(self, fingerprint: str) -> None:
+        if fingerprint in self._store:
+            del self._store[fingerprint]
+            self._save()
 
 
 # =============================================================================
@@ -483,12 +606,21 @@ def find_function_in_binary(binary_path: str, offset: int, function_name: str,
                 continue
                 
             # Adjust for label offset within the object
-            sig_start = label.offset
+            sig_start = label.offset            
+            sig_end = len(parsed)
+            for l in obj.labels:
+                # skip asm-generated labels
+                if l.name.startswith(("loc_", "text_")):
+                    continue
+                if l.offset > sig_start:
+                    sig_end = l.offset
+                    break  # assumes obj.labels are sorted by offset
+
             
             matching_bytes = 0
             total_concrete_bytes = 0
             
-            for i, (expected, is_wildcard) in enumerate(parsed[sig_start:]):
+            for i, (expected, is_wildcard) in enumerate(parsed[sig_start:sig_end]):
                 if i >= len(binary_data):
                     break
                     
@@ -987,6 +1119,9 @@ class PSYQApp:
         self.scan_align_to_4 = True
         self.scan_export_path = ""
         self.scan_filter_text = ""
+        self.scan_show_false_positives = False
+        self.scan_binary_fingerprint = ""
+        self.fp_store = FalsePositiveStore()
         
         # Status
         self.status_message = "Initializing..."
@@ -1685,12 +1820,21 @@ class PSYQApp:
         # Results
         if self.scan_results:
             ambiguous_count = sum(1 for r in self.scan_results if r.is_ambiguous)
+            fp_count = sum(
+                1 for r in self.scan_results
+                if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                    self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+                )
+            )
+            
             summary = f"Found {len(self.scan_results)} objects in binary"
             if ambiguous_count:
                 summary += f" ({ambiguous_count} ambiguous)"
+            if fp_count:
+                summary += f" [{fp_count} hidden as false positive]"
             imgui.text(summary)
             
-            # Filter
+            # Filter row
             imgui.text("Filter:")
             imgui.same_line()
             _, self.scan_filter_text = imgui.input_text(
@@ -1700,30 +1844,62 @@ class PSYQApp:
             if imgui.small_button("Export CSV"):
                 self._export_scan_results()
             
+            # FP controls row
+            _, self.scan_show_false_positives = imgui.checkbox(
+                "Show false positives", self.scan_show_false_positives
+            )
+            if fp_count:
+                imgui.same_line()
+                if imgui.small_button("Clear all FPs for this binary"):
+                    self.fp_store.clear_for_binary(self.scan_binary_fingerprint)
+            
             # Filtered results
             filter_lower = self.scan_filter_text.lower()
-            filtered = [
-                r for r in self.scan_results
-                if not filter_lower 
-                or filter_lower in r.library.lower()
-                or filter_lower in r.object_name.lower()
-                or any(filter_lower in v for v in r.versions)
-                or any(filter_lower in lbl.name.lower() for lbl in r.labels)
-                or (filter_lower == "ambiguous" and r.is_ambiguous)
-            ]
+            filtered = []
+            for r in self.scan_results:
+                is_fp = (
+                    self.scan_binary_fingerprint
+                    and self.fp_store.is_false_positive(
+                        self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+                    )
+                )
+                
+                # Skip FPs unless showing them
+                if is_fp and not self.scan_show_false_positives:
+                    continue
+                
+                # Apply text filter
+                if filter_lower:
+                    if not (
+                        filter_lower in r.library.lower()
+                        or filter_lower in r.object_name.lower()
+                        or any(filter_lower in v for v in r.versions)
+                        or any(filter_lower in lbl.name.lower() for lbl in r.labels)
+                        or (filter_lower == "ambiguous" and r.is_ambiguous)
+                        or (filter_lower == "false positive" and is_fp)
+                    ):
+                        continue
+                
+                filtered.append((r, is_fp))
             
             imgui.text(f"Showing {len(filtered)} of {len(self.scan_results)} results")
             imgui.same_line()
-            imgui.text_colored("(filter 'ambiguous' to show only ambiguous matches)", 0.5, 0.5, 0.5, 1.0)
+            imgui.text_colored(
+                "(filter 'ambiguous' or 'false positive')",
+                0.5, 0.5, 0.5, 1.0
+            )
             
             imgui.begin_child("scan_results", 0, 0, border=True)
             
             # Header
-            imgui.columns(5, "scan_columns")
-            imgui.set_column_width(0, 90)
-            imgui.set_column_width(1, 130)
-            imgui.set_column_width(2, 140)
-            imgui.set_column_width(3, 80)
+            imgui.columns(6, "scan_columns")
+            imgui.set_column_width(0, 35)   # Action
+            imgui.set_column_width(1, 90)   # Offset
+            imgui.set_column_width(2, 130)  # Library
+            imgui.set_column_width(3, 140)  # Object
+            imgui.set_column_width(4, 80)   # Size
+            imgui.text("")
+            imgui.next_column()
             imgui.text("Offset")
             imgui.next_column()
             imgui.text("Library")
@@ -1736,45 +1912,81 @@ class PSYQApp:
             imgui.columns(1)
             imgui.separator()
             
-            for result in filtered:
-                imgui.columns(5, f"scan_{result.offset:X}_{result.object_name}")
-                imgui.set_column_width(0, 90)
-                imgui.set_column_width(1, 130)
-                imgui.set_column_width(2, 140)
-                imgui.set_column_width(3, 80)
+            for result, is_fp in filtered:
+                row_id = f"scan_{result.offset:X}_{result.object_name}"
+                imgui.columns(6, row_id)
+                imgui.set_column_width(0, 35)
+                imgui.set_column_width(1, 90)
+                imgui.set_column_width(2, 130)
+                imgui.set_column_width(3, 140)
+                imgui.set_column_width(4, 80)
                 
-                # Offset — yellow if ambiguous
-                if result.is_ambiguous:
+                # Action column: FP toggle button
+                if is_fp:
+                    if imgui.small_button(f"+##{row_id}"):
+                        self.fp_store.unmark(
+                            self.scan_binary_fingerprint,
+                            result.offset, result.library, result.object_name
+                        )
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Restore (unmark as false positive)")
+                else:
+                    if imgui.small_button(f"X##{row_id}"):
+                        self.fp_store.mark(
+                            self.scan_binary_fingerprint,
+                            result.offset, result.library, result.object_name
+                        )
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Mark as false positive")
+                imgui.next_column()
+                
+                # Offset — yellow if ambiguous, red+strikethrough-ish if FP
+                if is_fp:
+                    imgui.text_colored(f"0x{result.offset:08X}", 0.5, 0.5, 0.5, 1.0)
+                elif result.is_ambiguous:
                     imgui.text_colored(f"0x{result.offset:08X}", 1.0, 0.9, 0.3, 1.0)
                 else:
                     imgui.text(f"0x{result.offset:08X}")
                 imgui.next_column()
-                imgui.text(result.library)
+                
+                if is_fp:
+                    imgui.text_colored(result.library, 0.5, 0.5, 0.5, 1.0)
+                else:
+                    imgui.text(result.library)
                 imgui.next_column()
-                imgui.text(result.object_name)
+                
+                if is_fp:
+                    imgui.text_colored(result.object_name, 0.5, 0.5, 0.5, 1.0)
+                else:
+                    imgui.text(result.object_name)
                 imgui.next_column()
                 
                 # Size column
                 if result.is_ambiguous:
-                    # Show range of sizes
                     sizes = sorted(set(vg.sig_length for vg in result.version_groups))
                     if len(sizes) > 1:
-                        imgui.text_colored(
-                            f"0x{sizes[0]:X}-0x{sizes[-1]:X}",
-                            1.0, 0.9, 0.3, 1.0
-                        )
+                        size_text = f"0x{sizes[0]:X}-0x{sizes[-1]:X}"
                     else:
-                        imgui.text(f"0x{sizes[0]:X}")
+                        size_text = f"0x{sizes[0]:X}"
+                    if is_fp:
+                        imgui.text_colored(size_text, 0.5, 0.5, 0.5, 1.0)
+                    else:
+                        imgui.text_colored(size_text, 1.0, 0.9, 0.3, 1.0)
                 else:
-                    imgui.text(f"0x{result.sig_length:X}")
+                    size_text = f"0x{result.sig_length:X}"
+                    if is_fp:
+                        imgui.text_colored(size_text, 0.5, 0.5, 0.5, 1.0)
+                    else:
+                        imgui.text(size_text)
                 imgui.next_column()
                 
                 # Versions column
-                if result.is_ambiguous:
-                    # Show ambiguity warning
+                if is_fp:
+                    imgui.text_colored("[FALSE POSITIVE]", 0.5, 0.5, 0.5, 1.0)
+                    version_str = ", ".join(result.versions)
+                    imgui.text_colored(f"  {version_str}", 0.4, 0.4, 0.4, 1.0)
+                elif result.is_ambiguous:
                     imgui.text_colored("[AMBIGUOUS - signature prefix overlap]", 1.0, 0.9, 0.3, 1.0)
-                    
-                    # Show each version group with its sig length
                     for vg in result.version_groups:
                         version_str = ", ".join(vg.versions)
                         imgui.text_colored(
@@ -1782,18 +1994,22 @@ class PSYQApp:
                             0.9, 0.85, 0.5, 1.0
                         )
                 else:
-                    # Normal: single version group
                     version_str = ", ".join(result.versions)
                     imgui.text_wrapped(version_str)
                 
                 # Show function labels in this object
-                func_labels = [l for l in result.labels if l.name.startswith("_") or l.offset == 0]
-                if func_labels:
-                    for lbl in func_labels:
-                        imgui.text_colored(
-                            f"  {lbl.name} (+0x{lbl.offset:X} = 0x{result.offset + lbl.offset:08X})",
-                            0.5, 0.8, 1.0, 1.0
-                        )
+                if not is_fp:
+                    func_labels = [
+                        l for l in result.labels
+                        if not (l.name.startswith("loc_") or l.name.startswith("text_"))
+                    ]
+                
+                    if func_labels:
+                        for lbl in func_labels:
+                            imgui.text_colored(
+                                f"  {lbl.name} (+0x{lbl.offset:X} = 0x{result.offset + lbl.offset:08X})",
+                                0.5, 0.8, 1.0, 1.0
+                            )
                 
                 imgui.columns(1)
                 imgui.separator()
@@ -1829,6 +2045,9 @@ class PSYQApp:
         self.scan_running = True
         self.status_message = "Scanning binary..."
         
+        # Compute binary fingerprint for false positive tracking
+        self.scan_binary_fingerprint = FalsePositiveStore.fingerprint(self.scan_binary_path)
+        
         align = 4 if self.scan_align_to_4 else 1
         
         try:
@@ -1842,11 +2061,13 @@ class PSYQApp:
                 for r in self.scan_results
             )
             ambiguous = sum(1 for r in self.scan_results if r.is_ambiguous)
+            fp_count = self.fp_store.get_count(self.scan_binary_fingerprint)
             
             ambig_msg = f", {ambiguous} ambiguous" if ambiguous else ""
+            fp_msg = f", {fp_count} marked as false positive" if fp_count else ""
             self.status_message = (
                 f"Scan complete: {unique_objects} objects found across "
-                f"{unique_libs} libraries, {total_funcs} functions identified{ambig_msg}"
+                f"{unique_libs} libraries, {total_funcs} functions identified{ambig_msg}{fp_msg}"
             )
         except Exception as e:
             self.status_message = f"Scan failed: {e}"
@@ -1855,7 +2076,7 @@ class PSYQApp:
         self.scan_running = False
     
     def _export_scan_results(self):
-        """Export scan results to CSV."""
+        """Export scan results to CSV, excluding false positives."""
         if not self.scan_results:
             return
         
@@ -1867,16 +2088,24 @@ class PSYQApp:
             export_path = "psyq_scan.csv"
         
         try:
+            exported = 0
+            skipped_fp = 0
             with open(export_path, "w") as f:
                 f.write("Offset,Library,Object,Size,Ambiguous,SDK Versions,Functions\n")
                 for r in self.scan_results:
+                    # Skip false positives
+                    if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                        self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+                    ):
+                        skipped_fp += 1
+                        continue
+                    
                     func_labels = [l for l in r.labels if l.name.startswith("_") or l.offset == 0]
                     funcs_str = "; ".join(
                         f"{l.name} (0x{r.offset + l.offset:08X})" for l in func_labels
                     )
                     
                     if r.is_ambiguous:
-                        # Show each version group with its size
                         version_parts = []
                         for vg in r.version_groups:
                             v_str = "+".join(vg.versions)
@@ -1894,7 +2123,10 @@ class PSYQApp:
                         f"\"{versions_str}\","
                         f"\"{funcs_str}\"\n"
                     )
-            self.status_message = f"Exported to {export_path}"
+                    exported += 1
+            
+            fp_msg = f" ({skipped_fp} false positives excluded)" if skipped_fp else ""
+            self.status_message = f"Exported {exported} results to {export_path}{fp_msg}"
         except Exception as e:
             self.status_message = f"Export failed: {e}"
     
