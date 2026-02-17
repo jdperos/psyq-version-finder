@@ -23,6 +23,8 @@ python psyq-finder.py
 
 ### Compare Functions
 
+<img width="1187" height="927" alt="image" src="https://github.com/user-attachments/assets/1410d175-b1fd-43f4-b339-e2a894f9804c" />
+
 Select two SDK versions and a library to see a color-coded byte diff of any function:
 
 - **Gray** — identical bytes
@@ -33,12 +35,16 @@ Useful for quickly spotting the differences when you've narrowed it down to a fe
 
 ### Match Function
 
+<img width="1174" height="918" alt="image" src="https://github.com/user-attachments/assets/487eabf2-0e93-4182-ac3a-992ab4b5bd1f" />
+
 Point the tool at your binary, specify an offset and function name, and it searches the signature database to find matching SDK versions.
 
 - Select a specific library (e.g., `LIBSPU.LIB`) to search only that library across all SDK versions
 - Results show match percentage so you can see how confident the match is
 
 ### Match Object
+
+<img width="1130" height="684" alt="image" src="https://github.com/user-attachments/assets/cfbdc506-59b5-4d4e-9f02-8333489cabd6" />
 
 Since old compilers linked entire objects (not individual functions), you can match a whole object signature for more reliable results.
 
@@ -49,6 +55,8 @@ Since old compilers linked entire objects (not individual functions), you can ma
 This is generally more reliable than function matching since you're comparing the entire compiled object file.
 
 ### Find Function
+
+<img width="1133" height="685" alt="image" src="https://github.com/user-attachments/assets/204fabf2-23ba-4dd5-a43d-f7ab3176703a" />
 
 Search for a function by name to see which library and object it lives in across all SDK versions.
 
@@ -63,6 +71,8 @@ Example output for a function that moved between objects:
 | LIBSPU.LIB | SPU_NEW.OBJ | 410, 420, 430, 440, 446, 451, 460, 470 |
 
 ### Scan Binary
+
+<img width="1692" height="1313" alt="image" src="https://github.com/user-attachments/assets/745c3e78-2498-425e-84b9-dffaf4cff430" />
 
 Point the tool at your entire PS1 binary and it will find **every** PSY-Q object present, reporting the offset, library, object name, functions within each object, and which SDK versions match.
 
@@ -81,6 +91,17 @@ For a typical 2MB PS1 binary, expect a scan to complete in seconds.
 **Export:** Results can be exported to CSV for use in your decompilation project.
 
 **Tip:** Use the library filter during preprocessing if you only care about specific libraries — this speeds up both preprocessing and scanning.
+
+### Library Explorer
+
+<img width="1458" height="829" alt="image" src="https://github.com/user-attachments/assets/44b82418-a9c8-4c24-8f3a-965d4f7f42da" />
+
+Browse the raw contents of any PSY-Q library across SDK versions. Select a version and library from the dropdowns to see all objects in that library.
+
+- Left panel: Filterable object list — search by object name or function name
+- Right panel: Full details for the selected object including all function labels with offsets, internal labels (collapsed by default), and a hex view of the signature with label markers and ASCII column
+
+Useful for quickly checking what functions live in an object, seeing exact signature bytes, or comparing how a library's structure changed between SDK versions without digging through raw JSON files.
 
 ### Caching
 
