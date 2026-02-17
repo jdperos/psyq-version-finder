@@ -15,8 +15,8 @@ This tool speeds up the process by letting you visually diff signatures between 
 ## Installation
 
 ```bash
-pip install imgui[glfw] glfw PyOpenGL requests
-python psyq_version_finder.py
+pip install -r requirements.txt
+python psyq-finder.py
 ```
 
 ## Features
