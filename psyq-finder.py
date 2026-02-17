@@ -286,6 +286,17 @@ class SDKManager:
         self._versions_cache = []
         self._libraries_cache = {}
         self._loaded_libraries = {}
+    
+    def get_all_library_names(self) -> list[str]:
+        """Get a list of all unique library names across all SDK versions."""
+        all_libs = set()
+        versions = self.discover_versions()
+        
+        for version in versions:
+            libs = self.discover_libraries(version)
+            all_libs.update(libs)
+        
+        return sorted(all_libs)
 
 
 # =============================================================================
@@ -387,10 +398,18 @@ def match_binary_to_signature(binary_data: bytes, sig: str) -> bool:
 
 
 def find_function_in_binary(binary_path: str, offset: int, function_name: str, 
-                            sdk_manager: SDKManager) -> list[tuple[str, str, float]]:
+                            sdk_manager: SDKManager,
+                            library_filter: Optional[str] = None) -> list[tuple[str, str, float]]:
     """
     Find which SDK versions match a function at a given offset.
     Returns list of (version, library, match_percentage) tuples.
+    
+    Args:
+        binary_path: Path to the binary file
+        offset: Offset in the binary where the function starts
+        function_name: Name of the function to search for
+        sdk_manager: SDKManager instance
+        library_filter: If provided, only search this specific library
     """
     try:
         with open(binary_path, "rb") as f:
@@ -405,7 +424,12 @@ def find_function_in_binary(binary_path: str, offset: int, function_name: str,
     versions = sdk_manager.discover_versions()
     
     for version in versions:
-        libraries = sdk_manager.discover_libraries(version)
+        if library_filter:
+            # Only search the specified library
+            libraries = [library_filter]
+        else:
+            libraries = sdk_manager.discover_libraries(version)
+        
         for lib_name in libraries:
             lib = sdk_manager.fetch_library(version, lib_name)
             if not lib:
@@ -480,6 +504,8 @@ class PSYQApp:
         self.function_name = ""
         self.match_results: list[tuple[str, str, float]] = []
         self.matching = False
+        self.match_library_idx = 0
+        self.all_libraries: list[str] = []  # Will be populated on first access
         
         # Status
         self.status_message = "Initializing..."
@@ -695,6 +721,16 @@ class PSYQApp:
         imgui.text("Function Offset (hex):")
         _, self.binary_offset_str = imgui.input_text("##offset", self.binary_offset_str, 32)
         
+        # Library selector
+        imgui.text("Library:")
+        if not self.all_libraries:
+            # Lazy load library list
+            self.all_libraries = ["(All Libraries)"] + self.sdk_manager.get_all_library_names()
+        
+        _, self.match_library_idx = imgui.combo(
+            "##library", self.match_library_idx, self.all_libraries
+        )
+        
         # Function name
         imgui.text("Function Name:")
         _, self.function_name = imgui.input_text("##func_name", self.function_name, 256)
@@ -761,11 +797,20 @@ class PSYQApp:
             self.status_message = f"File not found: {self.binary_path}"
             return
         
+        # Get library filter (None if "All Libraries" selected)
+        library_filter = None
+        if self.match_library_idx > 0 and self.all_libraries:
+            library_filter = self.all_libraries[self.match_library_idx]
+        
         self.matching = True
-        self.status_message = f"Searching for {self.function_name} at offset 0x{offset:X}..."
+        if library_filter:
+            self.status_message = f"Searching for {self.function_name} in {library_filter}..."
+        else:
+            self.status_message = f"Searching for {self.function_name} in all libraries..."
         
         self.match_results = find_function_in_binary(
-            self.binary_path, offset, self.function_name, self.sdk_manager
+            self.binary_path, offset, self.function_name, self.sdk_manager,
+            library_filter=library_filter
         )
         
         self.matching = False
@@ -789,6 +834,8 @@ class PSYQApp:
             self.sdk_manager.clear_cache()
             self.versions = []
             self.libraries = {}
+            self.all_libraries = []  # Reset library list so it gets refreshed
+            self.match_library_idx = 0
             self._init_versions()
             self.status_message = "Cache cleared"
         
