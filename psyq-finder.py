@@ -11,10 +11,10 @@ Features:
 - Matches binary data against signatures to identify versions
 
 Dependencies:
-    pip install imgui[glfw] glfw PyOpenGL requests
+    pip install -r requirements.txt
 
 Usage:
-    python psyq_version_finder.py
+    python psyq-finder.py
 """
 
 import json
@@ -498,14 +498,23 @@ class PSYQApp:
         self.compare_lib1: Optional[Library] = None
         self.compare_lib2: Optional[Library] = None
         
-        # Tab 2: Match Binary
-        self.binary_path = ""
-        self.binary_offset_str = "0"
+        # Tab 2: Match Function
+        self.func_binary_path = ""
+        self.func_offset_str = "0"
         self.function_name = ""
-        self.match_results: list[tuple[str, str, float]] = []
-        self.matching = False
-        self.match_library_idx = 0
+        self.func_match_results: list[tuple[str, str, float]] = []
+        self.func_matching = False
+        self.func_library_idx = 0
         self.all_libraries: list[str] = []  # Will be populated on first access
+        
+        # Tab 3: Match Object
+        self.obj_binary_path = ""
+        self.obj_offset_str = "0"
+        self.obj_library_idx = 0
+        self.obj_object_idx = 0
+        self.obj_objects_list: list[str] = []  # Objects in selected library
+        self.obj_match_results: list[tuple[str, float, int, int]] = []  # (version, match%, matched, total)
+        self.obj_matching = False
         
         # Status
         self.status_message = "Initializing..."
@@ -704,22 +713,21 @@ class PSYQApp:
         imgui.same_line()
         imgui.text_colored("Different", 1.0, 0.5, 0.3, 1.0)
     
-    def render_match_tab(self):
-        """Render the binary matching tab."""
+    def render_match_function_tab(self):
+        """Render the function matching tab."""
         imgui.text("Match a function in your binary against SDK signatures")
         imgui.separator()
         
         # Binary path
         imgui.text("Binary File:")
-        changed, self.binary_path = imgui.input_text("##binary_path", self.binary_path, 512)
+        changed, self.func_binary_path = imgui.input_text("##func_binary_path", self.func_binary_path, 512)
         imgui.same_line()
-        if imgui.button("Browse..."):
-            # Note: In a real app, you'd use a file dialog here
+        if imgui.button("Browse##func"):
             self.status_message = "File dialog not implemented - enter path manually"
         
         # Offset
         imgui.text("Function Offset (hex):")
-        _, self.binary_offset_str = imgui.input_text("##offset", self.binary_offset_str, 32)
+        _, self.func_offset_str = imgui.input_text("##func_offset", self.func_offset_str, 32)
         
         # Library selector
         imgui.text("Library:")
@@ -727,8 +735,8 @@ class PSYQApp:
             # Lazy load library list
             self.all_libraries = ["(All Libraries)"] + self.sdk_manager.get_all_library_names()
         
-        _, self.match_library_idx = imgui.combo(
-            "##library", self.match_library_idx, self.all_libraries
+        _, self.func_library_idx = imgui.combo(
+            "##func_library", self.func_library_idx, self.all_libraries
         )
         
         # Function name
@@ -738,17 +746,17 @@ class PSYQApp:
         imgui.separator()
         
         if imgui.button("Find Matching Versions", width=200):
-            self._do_match()
+            self._do_match_function()
         
         imgui.separator()
         
         # Results
-        if self.match_results:
-            imgui.text(f"Found {len(self.match_results)} potential matches:")
+        if self.func_match_results:
+            imgui.text(f"Found {len(self.func_match_results)} potential matches:")
             
-            imgui.begin_child("match_results", 0, 200, border=True)
+            imgui.begin_child("func_match_results", 0, 200, border=True)
             
-            imgui.columns(3, "match_columns")
+            imgui.columns(3, "func_match_columns")
             imgui.text("SDK Version")
             imgui.next_column()
             imgui.text("Library")
@@ -757,8 +765,8 @@ class PSYQApp:
             imgui.columns(1)
             imgui.separator()
             
-            for version, lib_name, match_pct in self.match_results:
-                imgui.columns(3, f"match_{version}_{lib_name}")
+            for version, lib_name, match_pct in self.func_match_results:
+                imgui.columns(3, f"func_match_{version}_{lib_name}")
                 imgui.text(version)
                 imgui.next_column()
                 imgui.text(lib_name)
@@ -775,47 +783,238 @@ class PSYQApp:
                 imgui.columns(1)
             
             imgui.end_child()
-        elif self.matching:
+        elif self.func_matching:
             imgui.text("Searching...")
     
-    def _do_match(self):
-        """Perform binary matching."""
-        if not self.binary_path or not self.function_name:
+    def _do_match_function(self):
+        """Perform function matching."""
+        if not self.func_binary_path or not self.function_name:
             self.status_message = "Please enter binary path and function name"
             return
         
         try:
-            offset = int(self.binary_offset_str, 16) if self.binary_offset_str.startswith("0x") or any(c in self.binary_offset_str.lower() for c in "abcdef") else int(self.binary_offset_str, 16)
+            offset = int(self.func_offset_str, 16) if self.func_offset_str.startswith("0x") or any(c in self.func_offset_str.lower() for c in "abcdef") else int(self.func_offset_str, 16)
         except ValueError:
             try:
-                offset = int(self.binary_offset_str)
+                offset = int(self.func_offset_str)
             except ValueError:
                 self.status_message = "Invalid offset format"
                 return
         
-        if not os.path.exists(self.binary_path):
-            self.status_message = f"File not found: {self.binary_path}"
+        if not os.path.exists(self.func_binary_path):
+            self.status_message = f"File not found: {self.func_binary_path}"
             return
         
         # Get library filter (None if "All Libraries" selected)
         library_filter = None
-        if self.match_library_idx > 0 and self.all_libraries:
-            library_filter = self.all_libraries[self.match_library_idx]
+        if self.func_library_idx > 0 and self.all_libraries:
+            library_filter = self.all_libraries[self.func_library_idx]
         
-        self.matching = True
+        self.func_matching = True
         if library_filter:
             self.status_message = f"Searching for {self.function_name} in {library_filter}..."
         else:
             self.status_message = f"Searching for {self.function_name} in all libraries..."
         
-        self.match_results = find_function_in_binary(
-            self.binary_path, offset, self.function_name, self.sdk_manager,
+        self.func_match_results = find_function_in_binary(
+            self.func_binary_path, offset, self.function_name, self.sdk_manager,
             library_filter=library_filter
         )
         
-        self.matching = False
-        if self.match_results:
-            self.status_message = f"Found {len(self.match_results)} potential matches"
+        self.func_matching = False
+        if self.func_match_results:
+            self.status_message = f"Found {len(self.func_match_results)} potential matches"
+        else:
+            self.status_message = "No matches found"
+    
+    def _get_objects_for_library(self, library_name: str) -> list[str]:
+        """Get list of object names for a library (from any SDK version that has it)."""
+        # Try to get from any cached version
+        for version in self.versions:
+            lib = self.sdk_manager.fetch_library(version, library_name)
+            if lib and lib.objects:
+                return sorted(set(obj.name for obj in lib.objects))
+        return []
+    
+    def render_match_object_tab(self):
+        """Render the object matching tab."""
+        imgui.text("Match an entire object in your binary against SDK signatures")
+        imgui.text_colored("(More reliable than function matching - compares entire object)", 0.7, 0.7, 0.7, 1.0)
+        imgui.separator()
+        
+        # Binary path
+        imgui.text("Binary File:")
+        changed, self.obj_binary_path = imgui.input_text("##obj_binary_path", self.obj_binary_path, 512)
+        imgui.same_line()
+        if imgui.button("Browse##obj"):
+            self.status_message = "File dialog not implemented - enter path manually"
+        
+        # Offset
+        imgui.text("Object Offset (hex):")
+        _, self.obj_offset_str = imgui.input_text("##obj_offset", self.obj_offset_str, 32)
+        
+        # Library selector
+        imgui.text("Library:")
+        if not self.all_libraries:
+            self.all_libraries = ["(All Libraries)"] + self.sdk_manager.get_all_library_names()
+        
+        # For object matching, we need a specific library (not "All")
+        lib_list = self.all_libraries[1:] if len(self.all_libraries) > 1 else []
+        if lib_list:
+            changed_lib, self.obj_library_idx = imgui.combo(
+                "##obj_library", self.obj_library_idx, lib_list
+            )
+            
+            # Clamp index
+            self.obj_library_idx = min(self.obj_library_idx, len(lib_list) - 1)
+            
+            # Update object list when library changes
+            if changed_lib or not self.obj_objects_list:
+                selected_lib = lib_list[self.obj_library_idx]
+                self.obj_objects_list = self._get_objects_for_library(selected_lib)
+                self.obj_object_idx = 0
+        
+        # Object selector
+        imgui.text("Object:")
+        if self.obj_objects_list:
+            _, self.obj_object_idx = imgui.combo(
+                "##obj_object", self.obj_object_idx, self.obj_objects_list
+            )
+            self.obj_object_idx = min(self.obj_object_idx, len(self.obj_objects_list) - 1)
+        else:
+            imgui.text_colored("(Select a library first)", 0.5, 0.5, 0.5, 1.0)
+        
+        imgui.separator()
+        
+        if self.obj_objects_list and imgui.button("Find Matching Versions", width=200):
+            self._do_match_object()
+        
+        imgui.separator()
+        
+        # Results
+        if self.obj_match_results:
+            imgui.text(f"Found {len(self.obj_match_results)} potential matches:")
+            
+            imgui.begin_child("obj_match_results", 0, 200, border=True)
+            
+            imgui.columns(4, "obj_match_columns")
+            imgui.text("SDK Version")
+            imgui.next_column()
+            imgui.text("Match %")
+            imgui.next_column()
+            imgui.text("Matched Bytes")
+            imgui.next_column()
+            imgui.text("Signature Size")
+            imgui.columns(1)
+            imgui.separator()
+            
+            for version, match_pct, matched, total in self.obj_match_results:
+                imgui.columns(4, f"obj_match_{version}")
+                imgui.text(version)
+                imgui.next_column()
+                
+                # Color based on match percentage
+                if match_pct >= 99:
+                    imgui.text_colored(f"{match_pct:.1f}%", 0.3, 1.0, 0.3, 1.0)
+                elif match_pct >= 95:
+                    imgui.text_colored(f"{match_pct:.1f}%", 0.7, 1.0, 0.3, 1.0)
+                elif match_pct >= 80:
+                    imgui.text_colored(f"{match_pct:.1f}%", 1.0, 1.0, 0.3, 1.0)
+                else:
+                    imgui.text_colored(f"{match_pct:.1f}%", 1.0, 0.5, 0.3, 1.0)
+                
+                imgui.next_column()
+                imgui.text(f"{matched}")
+                imgui.next_column()
+                imgui.text(f"{total}")
+                imgui.columns(1)
+            
+            imgui.end_child()
+        elif self.obj_matching:
+            imgui.text("Searching...")
+    
+    def _do_match_object(self):
+        """Perform object matching."""
+        if not self.obj_binary_path:
+            self.status_message = "Please enter binary path"
+            return
+        
+        if not self.obj_objects_list:
+            self.status_message = "Please select a library and object"
+            return
+        
+        try:
+            offset = int(self.obj_offset_str, 16) if self.obj_offset_str.startswith("0x") or any(c in self.obj_offset_str.lower() for c in "abcdef") else int(self.obj_offset_str, 16)
+        except ValueError:
+            try:
+                offset = int(self.obj_offset_str)
+            except ValueError:
+                self.status_message = "Invalid offset format"
+                return
+        
+        if not os.path.exists(self.obj_binary_path):
+            self.status_message = f"File not found: {self.obj_binary_path}"
+            return
+        
+        lib_list = self.all_libraries[1:] if len(self.all_libraries) > 1 else []
+        if not lib_list:
+            return
+        
+        library_name = lib_list[self.obj_library_idx]
+        object_name = self.obj_objects_list[self.obj_object_idx]
+        
+        self.obj_matching = True
+        self.status_message = f"Searching for {object_name} from {library_name}..."
+        
+        # Read binary data
+        try:
+            with open(self.obj_binary_path, "rb") as f:
+                f.seek(offset)
+                binary_data = f.read(0x10000)  # Read more for objects (64KB)
+        except Exception as e:
+            self.status_message = f"Failed to read binary: {e}"
+            self.obj_matching = False
+            return
+        
+        # Search across all SDK versions
+        results = []
+        for version in self.versions:
+            lib = self.sdk_manager.fetch_library(version, library_name)
+            if not lib:
+                continue
+            
+            # Find the object
+            for obj in lib.objects:
+                if obj.name == object_name:
+                    # Match against signature
+                    parsed = parse_signature(obj.sig)
+                    if not parsed:
+                        continue
+                    
+                    matching_bytes = 0
+                    total_concrete_bytes = 0
+                    
+                    for i, (expected, is_wildcard) in enumerate(parsed):
+                        if i >= len(binary_data):
+                            break
+                        if is_wildcard:
+                            continue
+                        total_concrete_bytes += 1
+                        if binary_data[i] == expected:
+                            matching_bytes += 1
+                    
+                    if total_concrete_bytes > 0:
+                        match_pct = (matching_bytes / total_concrete_bytes) * 100
+                        results.append((version, match_pct, matching_bytes, total_concrete_bytes))
+                    break
+        
+        # Sort by match percentage
+        results.sort(key=lambda x: x[1], reverse=True)
+        self.obj_match_results = results
+        
+        self.obj_matching = False
+        if results:
+            self.status_message = f"Found {len(results)} versions with matches"
         else:
             self.status_message = "No matches found"
     
@@ -835,7 +1034,10 @@ class PSYQApp:
             self.versions = []
             self.libraries = {}
             self.all_libraries = []  # Reset library list so it gets refreshed
-            self.match_library_idx = 0
+            self.func_library_idx = 0
+            self.obj_library_idx = 0
+            self.obj_objects_list = []
+            self.obj_object_idx = 0
             self._init_versions()
             self.status_message = "Cache cleared"
         
@@ -872,8 +1074,12 @@ class PSYQApp:
                 self.render_compare_tab()
                 imgui.end_tab_item()
             
-            if imgui.begin_tab_item("Match Binary")[0]:
-                self.render_match_tab()
+            if imgui.begin_tab_item("Match Function")[0]:
+                self.render_match_function_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Match Object")[0]:
+                self.render_match_object_tab()
                 imgui.end_tab_item()
             
             if imgui.begin_tab_item("Cache")[0]:

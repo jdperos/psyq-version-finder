@@ -31,12 +31,22 @@ Select two SDK versions and a library to see a color-coded byte diff of any func
 
 Useful for quickly spotting the differences when you've narrowed it down to a few candidate versions.
 
-### Match Binary
+### Match Function
 
 Point the tool at your binary, specify an offset and function name, and it searches the signature database to find matching SDK versions.
 
-- Select a specific library (e.g., `LIBSPU.LIB`) to search only that library across all SDK versions — much faster than searching everything
+- Select a specific library (e.g., `LIBSPU.LIB`) to search only that library across all SDK versions
 - Results show match percentage so you can see how confident the match is
+
+### Match Object
+
+Since old compilers linked entire objects (not individual functions), you can match a whole object signature for more reliable results.
+
+- Select a library and object name from dropdowns
+- Compares many more bytes than function matching, giving higher confidence results
+- Shows matched bytes vs total signature size so you can see exactly how much data was compared
+
+This is generally more reliable than function matching since you're comparing the entire compiled object file.
 
 ### Caching
 
@@ -44,9 +54,10 @@ Signature JSONs are fetched from [lab313ru/psx_psyq_signatures](https://github.c
 
 ## Tips
 
-- If you know roughly which library a function is from, use the library dropdown to speed up searches significantly
-- Functions at 95%+ match are usually exact matches — lower percentages may indicate version differences or relocation issues
+- **Match Object is more reliable than Match Function** — it compares way more bytes, so you get higher confidence matches
+- If you know roughly which library a function is from, use the library dropdown to speed up searches
 - The Compare Functions tab is great for understanding *what* changed between versions once you've identified candidates
+- Object matching reads 64KB from your binary, function matching reads 4KB — make sure your offset is correct
 
 ## Credits
 
