@@ -1636,6 +1636,8 @@ class PSYQApp:
         if changed_lib:
             # Reset preprocessing when library filter changes
             self.scan_preprocessed = False
+            self.scan_engine._preprocessed = False
+            self.scan_results = []
         
         # Alignment option
         _, self.scan_align_to_4 = imgui.checkbox("Require 4-byte alignment (MIPS)", self.scan_align_to_4)
@@ -1654,14 +1656,7 @@ class PSYQApp:
             if imgui.button("1. Preprocess Signatures", width=220):
                 self._do_scan_preprocess()
             imgui.same_line()
-            if self.scan_engine.is_preprocessed:
-                imgui.text_colored(
-                    f"({self.scan_engine.signature_count} unique sigs ready)",
-                    0.3, 1.0, 0.3, 1.0
-                )
-                self.scan_preprocessed = True
-            else:
-                imgui.text_colored("(Downloads & deduplicates all signatures)", 0.5, 0.5, 0.5, 1.0)
+            imgui.text_colored("(Downloads & deduplicates all signatures)", 0.5, 0.5, 0.5, 1.0)
         else:
             imgui.text_colored(
                 f"Signatures ready: {self.scan_engine.signature_count} unique patterns",
@@ -1670,6 +1665,8 @@ class PSYQApp:
             imgui.same_line()
             if imgui.small_button("Re-preprocess"):
                 self.scan_preprocessed = False
+                self.scan_engine._preprocessed = False
+                self.scan_results = []
         
         # Scan button
         if self.scan_preprocessed and self.scan_binary_path:
