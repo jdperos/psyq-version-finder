@@ -1435,13 +1435,18 @@ class PSYQApp:
             self.status_message = "No matches found"
     
     def _get_objects_for_library(self, library_name: str) -> list[str]:
-        """Get list of object names for a library (from any SDK version that has it)."""
-        # Try to get from any cached version
+        """Get list of object names for a library (union across all SDK versions that have it)."""
+        object_names: set[str] = set()
+    
         for version in self.versions:
             lib = self.sdk_manager.fetch_library(version, library_name)
-            if lib and lib.objects:
-                return sorted(set(obj.name for obj in lib.objects))
-        return []
+            if not lib or not lib.objects:
+                continue
+    
+            for obj in lib.objects:
+                object_names.add(obj.name)
+    
+        return sorted(object_names)
     
     def render_match_object_tab(self):
         """Render the object matching tab."""
