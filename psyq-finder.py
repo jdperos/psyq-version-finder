@@ -510,6 +510,279 @@ def find_function_in_binary(binary_path: str, offset: int, function_name: str,
 
 
 # =============================================================================
+# Full Binary Scanner
+# =============================================================================
+
+@dataclass
+class ScanSignature:
+    """A preprocessed signature ready for scanning."""
+    library: str
+    object_name: str
+    versions: list[str]
+    data: bytes          # Concrete byte values
+    mask: bytes          # 0xFF for concrete, 0x00 for wildcard
+    sig_length: int      # Total signature length
+    anchor_offset: int   # Offset of the anchor within the signature
+    anchor_bytes: bytes  # Longest consecutive concrete byte run
+    concrete_count: int  # Number of non-wildcard bytes (for match stats)
+
+
+@dataclass
+class ScanResult:
+    """A match found during binary scanning."""
+    offset: int
+    library: str
+    object_name: str
+    versions: list[str]
+    sig_length: int
+    labels: list[Label]  # Functions within this object
+
+
+class ScanEngine:
+    """
+    High-performance full-binary scanner for PSY-Q object signatures.
+    
+    Strategy:
+    1. Preprocess: Parse all signatures, deduplicate identical ones across versions,
+       extract the best "anchor" (longest consecutive concrete byte run) from each.
+    2. Scan: For each unique signature, use bytes.find() with the anchor to find
+       candidate offsets in the binary (C-optimized Boyer-Moore, very fast).
+    3. Verify: At each candidate offset, verify the full signature with mask.
+    4. Report: Group results by offset.
+    
+    MIPS alignment: PS1 uses 4-byte aligned code, so we only verify at aligned offsets.
+    """
+    
+    MIN_ANCHOR_LENGTH = 8  # Minimum anchor length to avoid too many false positives
+    
+    def __init__(self, sdk_manager: SDKManager):
+        self.sdk_manager = sdk_manager
+        self._signatures: list[ScanSignature] = []
+        self._preprocessed = False
+        self._progress_message = ""
+        self._progress_pct = 0.0
+    
+    @property
+    def progress_message(self) -> str:
+        return self._progress_message
+    
+    @property 
+    def progress_pct(self) -> float:
+        return self._progress_pct
+    
+    @property
+    def is_preprocessed(self) -> bool:
+        return self._preprocessed
+    
+    @property
+    def signature_count(self) -> int:
+        return len(self._signatures)
+    
+    def _find_best_anchor(self, mask: bytes) -> tuple[int, int]:
+        """
+        Find the longest consecutive run of concrete (0xFF) bytes in the mask.
+        Returns (offset, length) of the best anchor.
+        """
+        best_offset = 0
+        best_length = 0
+        current_offset = 0
+        current_length = 0
+        
+        for i, m in enumerate(mask):
+            if m == 0xFF:
+                if current_length == 0:
+                    current_offset = i
+                current_length += 1
+            else:
+                if current_length > best_length:
+                    best_offset = current_offset
+                    best_length = current_length
+                current_length = 0
+        
+        # Check the last run
+        if current_length > best_length:
+            best_offset = current_offset
+            best_length = current_length
+        
+        return best_offset, best_length
+    
+    def preprocess(self, library_filter: Optional[str] = None) -> None:
+        """
+        Preprocess all signatures from all SDK versions.
+        
+        Deduplicates identical signatures across versions so we only scan once
+        per unique byte pattern.
+        
+        Args:
+            library_filter: If set, only preprocess this library (faster).
+        """
+        self._signatures = []
+        self._preprocessed = False
+        
+        versions = self.sdk_manager.discover_versions()
+        
+        # Key: (library, object_name, data_bytes, mask_bytes) -> ScanSignature
+        # This deduplicates identical signatures across versions
+        sig_map: dict[tuple[str, str, bytes, bytes], ScanSignature] = {}
+        
+        # Also store labels per (library, object_name, version) for the results
+        labels_map: dict[tuple[str, str, str], list[Label]] = {}
+        
+        total_steps = len(versions)
+        
+        for step, version in enumerate(versions):
+            self._progress_message = f"Loading SDK {version}..."
+            self._progress_pct = step / total_steps
+            
+            if library_filter:
+                lib_names = [library_filter]
+            else:
+                lib_names = self.sdk_manager.discover_libraries(version)
+            
+            for lib_name in lib_names:
+                lib = self.sdk_manager.fetch_library(version, lib_name)
+                if not lib:
+                    continue
+                
+                for obj in lib.objects:
+                    if not obj.sig:
+                        continue
+                    
+                    data, mask = signature_to_bytes(obj.sig)
+                    if len(data) < self.MIN_ANCHOR_LENGTH:
+                        continue  # Too short to scan reliably
+                    
+                    key = (lib_name, obj.name, data, mask)
+                    labels_map[(lib_name, obj.name, version)] = obj.labels
+                    
+                    if key in sig_map:
+                        # Same signature already seen — just add this version
+                        sig_map[key].versions.append(version)
+                    else:
+                        # New unique signature
+                        anchor_off, anchor_len = self._find_best_anchor(mask)
+                        
+                        if anchor_len < self.MIN_ANCHOR_LENGTH:
+                            continue  # Not enough concrete bytes for a reliable anchor
+                        
+                        anchor_bytes = data[anchor_off:anchor_off + anchor_len]
+                        concrete_count = sum(1 for m in mask if m == 0xFF)
+                        
+                        sig_map[key] = ScanSignature(
+                            library=lib_name,
+                            object_name=obj.name,
+                            versions=[version],
+                            data=data,
+                            mask=mask,
+                            sig_length=len(data),
+                            anchor_offset=anchor_off,
+                            anchor_bytes=anchor_bytes,
+                            concrete_count=concrete_count,
+                        )
+        
+        self._signatures = list(sig_map.values())
+        # Sort versions within each signature
+        for sig in self._signatures:
+            sig.versions.sort(key=parse_sdk_version)
+        
+        self._labels_map = labels_map
+        self._preprocessed = True
+        self._progress_pct = 1.0
+        
+        # Stats
+        total_across_versions = sum(len(s.versions) for s in self._signatures)
+        self._progress_message = (
+            f"Preprocessed {len(self._signatures)} unique signatures "
+            f"({total_across_versions} total across versions)"
+        )
+    
+    def scan(self, binary_path: str, align: int = 4) -> list[ScanResult]:
+        """
+        Scan a binary file for all matching PSY-Q object signatures.
+        
+        Args:
+            binary_path: Path to the PS1 binary
+            align: Byte alignment for candidate offsets (4 for MIPS)
+        
+        Returns:
+            List of ScanResult sorted by offset
+        """
+        if not self._preprocessed:
+            raise RuntimeError("Must call preprocess() before scan()")
+        
+        # Load entire binary into memory
+        with open(binary_path, "rb") as f:
+            binary = f.read()
+        
+        binary_len = len(binary)
+        results: list[ScanResult] = []
+        
+        # For each unique signature, find candidates via anchor search
+        total_sigs = len(self._signatures)
+        
+        for sig_idx, sig in enumerate(self._signatures):
+            if sig_idx % 50 == 0:
+                self._progress_message = (
+                    f"Scanning: {sig_idx}/{total_sigs} signatures "
+                    f"({len(results)} matches so far)"
+                )
+                self._progress_pct = sig_idx / total_sigs
+            
+            anchor = sig.anchor_bytes
+            anchor_off = sig.anchor_offset
+            
+            # Use bytes.find() to locate anchor in binary — this is C-optimized
+            search_start = 0
+            while True:
+                pos = binary.find(anchor, search_start)
+                if pos == -1:
+                    break
+                
+                # The actual object start would be at pos - anchor_off
+                obj_start = pos - anchor_off
+                search_start = pos + 1
+                
+                # Bounds and alignment check
+                if obj_start < 0:
+                    continue
+                if align > 1 and obj_start % align != 0:
+                    continue
+                if obj_start + sig.sig_length > binary_len:
+                    continue
+                
+                # Full verification: check ALL concrete bytes
+                chunk = binary[obj_start:obj_start + sig.sig_length]
+                match = True
+                for i in range(sig.sig_length):
+                    if sig.mask[i] == 0xFF and chunk[i] != sig.data[i]:
+                        match = False
+                        break
+                
+                if match:
+                    # Collect labels from the first version (labels are usually the same)
+                    first_version = sig.versions[0]
+                    labels_key = (sig.library, sig.object_name, first_version)
+                    labels = self._labels_map.get(labels_key, [])
+                    
+                    results.append(ScanResult(
+                        offset=obj_start,
+                        library=sig.library,
+                        object_name=sig.object_name,
+                        versions=sig.versions,
+                        sig_length=sig.sig_length,
+                        labels=labels,
+                    ))
+        
+        # Sort by offset
+        results.sort(key=lambda r: r.offset)
+        
+        self._progress_pct = 1.0
+        self._progress_message = f"Scan complete: {len(results)} objects found"
+        
+        return results
+
+
+# =============================================================================
 # ImGui Application
 # =============================================================================
 
@@ -557,6 +830,17 @@ class PSYQApp:
         self.find_func_library_idx = 0  # 0 = All Libraries
         self.find_func_results: list[tuple[str, str, list[str]]] = []  # (library, object, [versions])
         self.find_func_searching = False
+        
+        # Tab 5: Scan Binary
+        self.scan_engine = ScanEngine(self.sdk_manager)
+        self.scan_binary_path = ""
+        self.scan_library_idx = 0  # 0 = All Libraries
+        self.scan_results: list[ScanResult] = []
+        self.scan_running = False
+        self.scan_preprocessed = False
+        self.scan_align_to_4 = True
+        self.scan_export_path = ""
+        self.scan_filter_text = ""
         
         # Status
         self.status_message = "Initializing..."
@@ -1179,6 +1463,248 @@ class PSYQApp:
         else:
             self.status_message = f"Function {self.find_func_name} not found"
     
+    def render_scan_tab(self):
+        """Render the full binary scan tab."""
+        imgui.text("Scan an entire binary to find all PSY-Q objects")
+        imgui.text_colored(
+            "Finds every SDK object in your binary with its offset and matching versions",
+            0.7, 0.7, 0.7, 1.0
+        )
+        imgui.separator()
+        
+        # Binary path
+        imgui.text("Binary File:")
+        _, self.scan_binary_path = imgui.input_text("##scan_binary_path", self.scan_binary_path, 512)
+        imgui.same_line()
+        if imgui.button("Browse##scan"):
+            self.status_message = "File dialog not implemented - enter path manually"
+        
+        # Library filter
+        imgui.text("Library Filter (optional, speeds up preprocessing):")
+        if not self.all_libraries:
+            self.all_libraries = ["(All Libraries)"] + self.sdk_manager.get_all_library_names()
+        
+        changed_lib, self.scan_library_idx = imgui.combo(
+            "##scan_library", self.scan_library_idx, self.all_libraries
+        )
+        if changed_lib:
+            # Reset preprocessing when library filter changes
+            self.scan_preprocessed = False
+        
+        # Alignment option
+        _, self.scan_align_to_4 = imgui.checkbox("Require 4-byte alignment (MIPS)", self.scan_align_to_4)
+        imgui.same_line()
+        imgui.text_colored("(?)", 0.5, 0.5, 0.5, 1.0)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "PS1 uses MIPS R3000 with 4-byte aligned instructions.\n"
+                "Disabling this checks every byte offset (slower, rarely needed)."
+            )
+        
+        imgui.separator()
+        
+        # Preprocess button
+        if not self.scan_preprocessed:
+            if imgui.button("1. Preprocess Signatures", width=220):
+                self._do_scan_preprocess()
+            imgui.same_line()
+            if self.scan_engine.is_preprocessed:
+                imgui.text_colored(
+                    f"({self.scan_engine.signature_count} unique sigs ready)",
+                    0.3, 1.0, 0.3, 1.0
+                )
+                self.scan_preprocessed = True
+            else:
+                imgui.text_colored("(Downloads & deduplicates all signatures)", 0.5, 0.5, 0.5, 1.0)
+        else:
+            imgui.text_colored(
+                f"Signatures ready: {self.scan_engine.signature_count} unique patterns",
+                0.3, 1.0, 0.3, 1.0
+            )
+            imgui.same_line()
+            if imgui.small_button("Re-preprocess"):
+                self.scan_preprocessed = False
+        
+        # Scan button
+        if self.scan_preprocessed and self.scan_binary_path:
+            if imgui.button("2. Scan Binary", width=220):
+                self._do_scan()
+        elif self.scan_preprocessed:
+            imgui.text_colored("Enter a binary path above to scan", 0.8, 0.6, 0.3, 1.0)
+        
+        imgui.separator()
+        
+        # Progress
+        if self.scan_running:
+            imgui.text(self.scan_engine.progress_message)
+            imgui.progress_bar(self.scan_engine.progress_pct, (-1, 0))
+        
+        # Results
+        if self.scan_results:
+            imgui.text(f"Found {len(self.scan_results)} objects in binary:")
+            
+            # Filter
+            imgui.text("Filter:")
+            imgui.same_line()
+            _, self.scan_filter_text = imgui.input_text(
+                "##scan_filter", self.scan_filter_text, 256
+            )
+            imgui.same_line()
+            if imgui.small_button("Export CSV"):
+                self._export_scan_results()
+            
+            # Filtered results
+            filter_lower = self.scan_filter_text.lower()
+            filtered = [
+                r for r in self.scan_results
+                if not filter_lower 
+                or filter_lower in r.library.lower()
+                or filter_lower in r.object_name.lower()
+                or any(filter_lower in v for v in r.versions)
+                or any(filter_lower in lbl.name.lower() for lbl in r.labels)
+            ]
+            
+            imgui.text(f"Showing {len(filtered)} of {len(self.scan_results)} results")
+            
+            imgui.begin_child("scan_results", 0, 0, border=True)
+            
+            # Header
+            imgui.columns(5, "scan_columns")
+            imgui.set_column_width(0, 90)
+            imgui.set_column_width(1, 130)
+            imgui.set_column_width(2, 140)
+            imgui.set_column_width(3, 80)
+            imgui.text("Offset")
+            imgui.next_column()
+            imgui.text("Library")
+            imgui.next_column()
+            imgui.text("Object")
+            imgui.next_column()
+            imgui.text("Size")
+            imgui.next_column()
+            imgui.text("SDK Versions (Functions)")
+            imgui.columns(1)
+            imgui.separator()
+            
+            for result in filtered:
+                imgui.columns(5, f"scan_{result.offset:X}_{result.object_name}")
+                imgui.set_column_width(0, 90)
+                imgui.set_column_width(1, 130)
+                imgui.set_column_width(2, 140)
+                imgui.set_column_width(3, 80)
+                
+                imgui.text(f"0x{result.offset:08X}")
+                imgui.next_column()
+                imgui.text(result.library)
+                imgui.next_column()
+                imgui.text(result.object_name)
+                imgui.next_column()
+                imgui.text(f"0x{result.sig_length:X}")
+                imgui.next_column()
+                
+                # Versions
+                version_str = ", ".join(result.versions)
+                imgui.text_wrapped(version_str)
+                
+                # Show function labels in this object
+                func_labels = [l for l in result.labels if l.name.startswith("_") or l.offset == 0]
+                if func_labels:
+                    for lbl in func_labels:
+                        imgui.text_colored(
+                            f"  {lbl.name} (+0x{lbl.offset:X} = 0x{result.offset + lbl.offset:08X})",
+                            0.5, 0.8, 1.0, 1.0
+                        )
+                
+                imgui.columns(1)
+                imgui.separator()
+            
+            imgui.end_child()
+    
+    def _do_scan_preprocess(self):
+        """Preprocess signatures for scanning."""
+        library_filter = None
+        if self.scan_library_idx > 0 and self.all_libraries:
+            library_filter = self.all_libraries[self.scan_library_idx]
+        
+        self.scan_running = True
+        filter_msg = f" (filtered to {library_filter})" if library_filter else ""
+        self.status_message = f"Preprocessing signatures{filter_msg}..."
+        
+        self.scan_engine.preprocess(library_filter=library_filter)
+        
+        self.scan_preprocessed = True
+        self.scan_running = False
+        self.status_message = self.scan_engine.progress_message
+    
+    def _do_scan(self):
+        """Perform the full binary scan."""
+        if not self.scan_binary_path:
+            self.status_message = "Please enter a binary path"
+            return
+        
+        if not os.path.exists(self.scan_binary_path):
+            self.status_message = f"File not found: {self.scan_binary_path}"
+            return
+        
+        self.scan_running = True
+        self.status_message = "Scanning binary..."
+        
+        align = 4 if self.scan_align_to_4 else 1
+        
+        try:
+            self.scan_results = self.scan_engine.scan(self.scan_binary_path, align=align)
+            
+            # Summary stats
+            unique_objects = len(self.scan_results)
+            unique_libs = len(set(r.library for r in self.scan_results))
+            total_funcs = sum(
+                len([l for l in r.labels if l.name.startswith("_") or l.offset == 0])
+                for r in self.scan_results
+            )
+            
+            self.status_message = (
+                f"Scan complete: {unique_objects} objects found across "
+                f"{unique_libs} libraries, {total_funcs} functions identified"
+            )
+        except Exception as e:
+            self.status_message = f"Scan failed: {e}"
+            self.scan_results = []
+        
+        self.scan_running = False
+    
+    def _export_scan_results(self):
+        """Export scan results to CSV."""
+        if not self.scan_results:
+            return
+        
+        # Default export path next to the binary
+        if self.scan_binary_path:
+            base = os.path.splitext(self.scan_binary_path)[0]
+            export_path = f"{base}_psyq_scan.csv"
+        else:
+            export_path = "psyq_scan.csv"
+        
+        try:
+            with open(export_path, "w") as f:
+                f.write("Offset,Library,Object,Size,SDK Versions,Functions\n")
+                for r in self.scan_results:
+                    func_labels = [l for l in r.labels if l.name.startswith("_") or l.offset == 0]
+                    funcs_str = "; ".join(
+                        f"{l.name} (0x{r.offset + l.offset:08X})" for l in func_labels
+                    )
+                    versions_str = "; ".join(r.versions)
+                    f.write(
+                        f"0x{r.offset:08X},"
+                        f"{r.library},"
+                        f"{r.object_name},"
+                        f"0x{r.sig_length:X},"
+                        f"\"{versions_str}\","
+                        f"\"{funcs_str}\"\n"
+                    )
+            self.status_message = f"Exported to {export_path}"
+        except Exception as e:
+            self.status_message = f"Export failed: {e}"
+    
     def render_cache_tab(self):
         """Render the cache management tab."""
         imgui.text("Cache Management")
@@ -1247,6 +1773,10 @@ class PSYQApp:
             
             if imgui.begin_tab_item("Find Function")[0]:
                 self.render_find_function_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Scan Binary")[0]:
+                self.render_scan_tab()
                 imgui.end_tab_item()
             
             if imgui.begin_tab_item("Cache")[0]:

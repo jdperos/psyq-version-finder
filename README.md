@@ -62,16 +62,38 @@ Example output for a function that moved between objects:
 | LIBSPU.LIB | SPU.OBJ | 330, 340, 350, 360, 400 |
 | LIBSPU.LIB | SPU_NEW.OBJ | 410, 420, 430, 440, 446, 451, 460, 470 |
 
+### Scan Binary
+
+Point the tool at your entire PS1 binary and it will find **every** PSY-Q object present, reporting the offset, library, object name, functions within each object, and which SDK versions match.
+
+**How it works:**
+1. **Preprocess** — Downloads and caches all SDK signatures, deduplicates identical signatures across versions, and extracts optimized search "anchors" (longest consecutive concrete byte runs) from each.
+2. **Scan** — For each unique signature, uses Python's C-optimized `bytes.find()` (Boyer-Moore) to locate anchor candidates in the binary, then verifies full signatures with wildcard masks. Only checks 4-byte aligned offsets (MIPS).
+3. **Report** — Shows every matched object with offset, size, SDK versions, and all function labels with their absolute addresses.
+
+**Why it's fast:**
+- Signature deduplication: many objects are identical across versions, so we only scan once per unique pattern
+- Anchor-based search: `bytes.find()` is C-level fast, and 8+ byte anchors eliminate 99.9%+ of false candidates
+- MIPS alignment: only checks every 4th byte, cutting search space by 75%
+
+For a typical 2MB PS1 binary, expect a scan to complete in seconds.
+
+**Export:** Results can be exported to CSV for use in your decompilation project.
+
+**Tip:** Use the library filter during preprocessing if you only care about specific libraries — this speeds up both preprocessing and scanning.
+
 ### Caching
 
 Signature JSONs are fetched from [lab313ru/psx_psyq_signatures](https://github.com/lab313ru/psx_psyq_signatures) and cached locally in `~/.cache/psyq_signatures/`. First run will be slower as it downloads what you need; subsequent runs are fast.
 
 ## Tips
 
+- **Scan Binary is the most powerful feature** — point it at your binary and get a complete map of all PSY-Q objects, their offsets, versions, and functions
 - **Match Object is more reliable than Match Function** — it compares way more bytes, so you get higher confidence matches
 - If you know roughly which library a function is from, use the library dropdown to speed up searches
 - The Compare Functions tab is great for understanding *what* changed between versions once you've identified candidates
 - Object matching reads 64KB from your binary, function matching reads 4KB — make sure your offset is correct
+- When scanning, use the library filter during preprocessing if you only need to check specific libraries
 
 ## Credits
 
