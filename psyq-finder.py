@@ -516,6 +516,12 @@ class PSYQApp:
         self.obj_match_results: list[tuple[str, float, int, int]] = []  # (version, match%, matched, total)
         self.obj_matching = False
         
+        # Tab 4: Find Function
+        self.find_func_name = ""
+        self.find_func_library_idx = 0  # 0 = All Libraries
+        self.find_func_results: list[tuple[str, str, list[str]]] = []  # (library, object, [versions])
+        self.find_func_searching = False
+        
         # Status
         self.status_message = "Initializing..."
         self.loading = False
@@ -1018,6 +1024,128 @@ class PSYQApp:
         else:
             self.status_message = "No matches found"
     
+    def render_find_function_tab(self):
+        """Render the function search tab."""
+        imgui.text("Search for a function to find which library/object it lives in")
+        imgui.separator()
+        
+        # Function name input
+        imgui.text("Function Name:")
+        _, self.find_func_name = imgui.input_text("##find_func_name", self.find_func_name, 256)
+        
+        # Optional library filter
+        imgui.text("Library Filter (optional):")
+        if not self.all_libraries:
+            self.all_libraries = ["(All Libraries)"] + self.sdk_manager.get_all_library_names()
+        
+        _, self.find_func_library_idx = imgui.combo(
+            "##find_func_library", self.find_func_library_idx, self.all_libraries
+        )
+        
+        imgui.separator()
+        
+        if imgui.button("Search", width=120):
+            self._do_find_function()
+        
+        imgui.same_line()
+        imgui.text_colored("(Searches all SDK versions)", 0.6, 0.6, 0.6, 1.0)
+        
+        imgui.separator()
+        
+        # Results
+        if self.find_func_results:
+            imgui.text(f"Found in {len(self.find_func_results)} location(s):")
+            
+            imgui.begin_child("find_func_results", 0, 300, border=True)
+            
+            imgui.columns(3, "find_func_columns")
+            imgui.text("Library")
+            imgui.next_column()
+            imgui.text("Object")
+            imgui.next_column()
+            imgui.text("SDK Versions")
+            imgui.columns(1)
+            imgui.separator()
+            
+            for library, obj_name, versions in self.find_func_results:
+                imgui.columns(3, f"find_{library}_{obj_name}")
+                imgui.text(library)
+                imgui.next_column()
+                imgui.text(obj_name)
+                imgui.next_column()
+                
+                # Format version list nicely
+                if len(versions) <= 5:
+                    version_str = ", ".join(versions)
+                else:
+                    version_str = f"{versions[0]}..{versions[-1]} ({len(versions)} versions)"
+                imgui.text_wrapped(version_str)
+                
+                imgui.columns(1)
+            
+            imgui.end_child()
+        elif self.find_func_searching:
+            imgui.text("Searching...")
+        elif self.find_func_name:
+            imgui.text("No results. Click Search to find the function.")
+    
+    def _do_find_function(self):
+        """Search for a function across all SDK versions."""
+        if not self.find_func_name:
+            self.status_message = "Please enter a function name"
+            return
+        
+        self.find_func_searching = True
+        self.status_message = f"Searching for {self.find_func_name}..."
+        
+        # Get library filter
+        library_filter = None
+        if self.find_func_library_idx > 0 and self.all_libraries:
+            library_filter = self.all_libraries[self.find_func_library_idx]
+        
+        # Dict to collect: (library, object) -> [versions]
+        location_versions: dict[tuple[str, str], list[str]] = {}
+        
+        for version in self.versions:
+            if library_filter:
+                libraries = [library_filter]
+            else:
+                libraries = self.sdk_manager.discover_libraries(version)
+            
+            for lib_name in libraries:
+                lib = self.sdk_manager.fetch_library(version, lib_name)
+                if not lib:
+                    continue
+                
+                # Search for the function in this library
+                for obj in lib.objects:
+                    for label in obj.labels:
+                        if label.name == self.find_func_name:
+                            key = (lib_name, obj.name)
+                            if key not in location_versions:
+                                location_versions[key] = []
+                            location_versions[key].append(version)
+                            break  # Found in this object, move on
+        
+        # Convert to result list and sort
+        results = []
+        for (library, obj_name), versions in location_versions.items():
+            # Sort versions numerically
+            versions.sort(key=lambda v: int(v))
+            results.append((library, obj_name, versions))
+        
+        # Sort results by library, then object
+        results.sort(key=lambda x: (x[0], x[1]))
+        
+        self.find_func_results = results
+        self.find_func_searching = False
+        
+        if results:
+            total_versions = sum(len(v) for _, _, v in results)
+            self.status_message = f"Found {self.find_func_name} in {len(results)} location(s) across {total_versions} version instances"
+        else:
+            self.status_message = f"Function {self.find_func_name} not found"
+    
     def render_cache_tab(self):
         """Render the cache management tab."""
         imgui.text("Cache Management")
@@ -1038,6 +1166,8 @@ class PSYQApp:
             self.obj_library_idx = 0
             self.obj_objects_list = []
             self.obj_object_idx = 0
+            self.find_func_library_idx = 0
+            self.find_func_results = []
             self._init_versions()
             self.status_message = "Cache cleared"
         
@@ -1080,6 +1210,10 @@ class PSYQApp:
             
             if imgui.begin_tab_item("Match Object")[0]:
                 self.render_match_object_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Find Function")[0]:
+                self.render_find_function_tab()
                 imgui.end_tab_item()
             
             if imgui.begin_tab_item("Cache")[0]:
