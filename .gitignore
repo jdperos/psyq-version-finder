@@ -1,2 +1,7 @@
 .venv/
 imgui.ini
+
+# build files
+build/
+dist/
+*.spec
