@@ -759,7 +759,7 @@ class ScanEngine:
         
         return best_offset, best_length
     
-    def preprocess(self, library_filter: Optional[str] = None) -> None:
+    def preprocess(self, library_filter: Optional[str] = None, version_filter: Optional[str] = None) -> None:
         """
         Preprocess all signatures from all SDK versions.
         
@@ -768,11 +768,16 @@ class ScanEngine:
         
         Args:
             library_filter: If set, only preprocess this library (faster).
+            version_filter: If set, only preprocess this SDK version (faster).
         """
         self._signatures = []
         self._preprocessed = False
         
         versions = self.sdk_manager.discover_versions()
+        
+        # Apply version filter
+        if version_filter:
+            versions = [v for v in versions if v == version_filter]
         
         # Key: (library, object_name, data_bytes, mask_bytes) -> ScanSignature
         # This deduplicates identical signatures across versions
@@ -1112,6 +1117,7 @@ class PSYQApp:
         # Tab 5: Scan Binary
         self.scan_engine = ScanEngine(self.sdk_manager)
         self.scan_binary_path = ""
+        self.scan_version_idx = 0  # 0 = All Versions
         self.scan_library_idx = 0  # 0 = All Libraries
         self.scan_results: list[ScanResult] = []
         self.scan_running = False
@@ -1788,6 +1794,18 @@ class PSYQApp:
             self.scan_engine._preprocessed = False
             self.scan_results = []
         
+        # Version filter
+        imgui.text("SDK Version Filter (optional, for single-version search):")
+        version_options = ["(All Versions)"] + self.versions
+        changed_ver, self.scan_version_idx = imgui.combo(
+            "##scan_version", self.scan_version_idx, version_options
+        )
+        if changed_ver:
+            # Reset preprocessing when version filter changes
+            self.scan_preprocessed = False
+            self.scan_engine._preprocessed = False
+            self.scan_results = []
+        
         # Alignment option
         _, self.scan_align_to_4 = imgui.checkbox("Require 4-byte alignment (MIPS)", self.scan_align_to_4)
         imgui.same_line()
@@ -1857,6 +1875,12 @@ class PSYQApp:
             imgui.same_line()
             if imgui.small_button("Export CSV"):
                 self._export_scan_results()
+            imgui.same_line()
+            if imgui.small_button("Export TXT"):
+                self._export_scan_results_txt()
+            imgui.same_line()
+            if imgui.small_button("Export JSON"):
+                self._export_scan_results_json()
             
             # FP controls row
             _, self.scan_show_false_positives = imgui.checkbox(
@@ -2036,11 +2060,20 @@ class PSYQApp:
         if self.scan_library_idx > 0 and self.all_libraries:
             library_filter = self.all_libraries[self.scan_library_idx]
         
+        version_filter = None
+        if self.scan_version_idx > 0 and self.versions:
+            version_filter = self.versions[self.scan_version_idx - 1]  # -1 because index 0 is "All Versions"
+        
         self.scan_running = True
-        filter_msg = f" (filtered to {library_filter})" if library_filter else ""
+        filter_parts = []
+        if library_filter:
+            filter_parts.append(f"library={library_filter}")
+        if version_filter:
+            filter_parts.append(f"version={version_filter}")
+        filter_msg = f" ({', '.join(filter_parts)})" if filter_parts else ""
         self.status_message = f"Preprocessing signatures{filter_msg}..."
         
-        self.scan_engine.preprocess(library_filter=library_filter)
+        self.scan_engine.preprocess(library_filter=library_filter, version_filter=version_filter)
         
         self.scan_preprocessed = True
         self.scan_running = False
@@ -2138,6 +2171,137 @@ class PSYQApp:
                         f"\"{funcs_str}\"\n"
                     )
                     exported += 1
+            
+            fp_msg = f" ({skipped_fp} false positives excluded)" if skipped_fp else ""
+            self.status_message = f"Exported {exported} results to {export_path}{fp_msg}"
+        except Exception as e:
+            self.status_message = f"Export failed: {e}"
+    
+    def _export_scan_results_txt(self):
+        """Export scan results to a simple text file with offsets."""
+        if not self.scan_results:
+            return
+        
+        # Default export path next to the binary
+        if self.scan_binary_path:
+            base = os.path.splitext(self.scan_binary_path)[0]
+            export_path = f"{base}_psyq_objects.txt"
+        else:
+            export_path = "psyq_objects.txt"
+        
+        # Get version filter info for header
+        version_info = ""
+        if self.scan_version_idx > 0 and self.versions:
+            version_info = f"SDK Version: {self.versions[self.scan_version_idx - 1]}\n"
+        else:
+            version_info = "SDK Version: All\n"
+        
+        try:
+            exported = 0
+            skipped_fp = 0
+            with open(export_path, "w") as f:
+                f.write("# PSY-Q SDK Object Scan Results\n")
+                f.write(f"# Binary: {self.scan_binary_path}\n")
+                f.write(f"# {version_info}")
+                f.write(f"# Objects found: {len(self.scan_results)}\n")
+                f.write("#\n")
+                f.write(f"# {'Offset':<12} {'Library':<20} {'Object':<25} {'Versions'}\n")
+                f.write(f"# {'-'*80}\n")
+                
+                for r in self.scan_results:
+                    # Skip false positives
+                    if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                        self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+                    ):
+                        skipped_fp += 1
+                        continue
+                    
+                    versions_str = ", ".join(r.versions)
+                    f.write(f"0x{r.offset:08X}  {r.library:<20} {r.object_name:<25} {versions_str}\n")
+                    exported += 1
+            
+            fp_msg = f" ({skipped_fp} false positives excluded)" if skipped_fp else ""
+            self.status_message = f"Exported {exported} results to {export_path}{fp_msg}"
+        except Exception as e:
+            self.status_message = f"Export failed: {e}"
+    
+    def _export_scan_results_json(self):
+        """Export scan results to JSON format."""
+        if not self.scan_results:
+            return
+        
+        # Default export path next to the binary
+        if self.scan_binary_path:
+            base = os.path.splitext(self.scan_binary_path)[0]
+            export_path = f"{base}_psyq_scan.json"
+        else:
+            export_path = "psyq_scan.json"
+        
+        # Get version filter info
+        version_filter = None
+        if self.scan_version_idx > 0 and self.versions:
+            version_filter = self.versions[self.scan_version_idx - 1]
+        
+        try:
+            exported = 0
+            skipped_fp = 0
+            
+            results_list = []
+            for r in self.scan_results:
+                # Skip false positives
+                if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                    self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+                ):
+                    skipped_fp += 1
+                    continue
+                
+                # Build function list
+                functions = []
+                for lbl in r.labels:
+                    if lbl.name.startswith("_") or lbl.offset == 0:
+                        functions.append({
+                            "name": lbl.name,
+                            "offset": r.offset + lbl.offset,
+                            "offset_hex": f"0x{r.offset + lbl.offset:08X}",
+                            "relative_offset": lbl.offset
+                        })
+                
+                result_obj = {
+                    "offset": r.offset,
+                    "offset_hex": f"0x{r.offset:08X}",
+                    "library": r.library,
+                    "object": r.object_name,
+                    "size": r.sig_length,
+                    "size_hex": f"0x{r.sig_length:X}",
+                    "versions": r.versions,
+                    "is_ambiguous": r.is_ambiguous,
+                    "functions": functions
+                }
+                
+                # Add version groups for ambiguous results
+                if r.is_ambiguous and r.version_groups:
+                    result_obj["version_groups"] = [
+                        {
+                            "sig_length": vg.sig_length,
+                            "sig_length_hex": f"0x{vg.sig_length:X}",
+                            "versions": vg.versions
+                        }
+                        for vg in r.version_groups
+                    ]
+                
+                results_list.append(result_obj)
+                exported += 1
+            
+            # Build final JSON structure
+            output = {
+                "binary": self.scan_binary_path,
+                "version_filter": version_filter,
+                "total_objects": exported,
+                "objects": results_list
+            }
+            
+            with open(export_path, "w") as f:
+                json.dump(output, f, indent=2)
             
             fp_msg = f" ({skipped_fp} false positives excluded)" if skipped_fp else ""
             self.status_message = f"Exported {exported} results to {export_path}{fp_msg}"
@@ -2432,6 +2596,10 @@ class PSYQApp:
             self.obj_object_idx = 0
             self.find_func_library_idx = 0
             self.find_func_results = []
+            self.scan_version_idx = 0
+            self.scan_library_idx = 0
+            self.scan_preprocessed = False
+            self.scan_results = []
             self._init_versions()
             self.status_message = "Cache cleared"
         
