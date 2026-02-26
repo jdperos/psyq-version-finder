@@ -642,6 +642,155 @@ def find_function_in_binary(binary_path: str, offset: int, function_name: str,
 
 
 # =============================================================================
+# Enrichment (ELF parsing with pyelftools - cross-platform)
+# =============================================================================
+
+try:
+    from elftools.elf.elffile import ELFFile
+    from elftools.elf.sections import SymbolTableSection
+    PYELFTOOLS_AVAILABLE = True
+except ImportError:
+    PYELFTOOLS_AVAILABLE = False
+
+
+def parse_elf_sections(elf_path: Path) -> dict[str, dict]:
+    """
+    Parse ELF sections using pyelftools.
+    Returns dict of section_name -> {size, offset, addr, type, flags}
+    """
+    if not PYELFTOOLS_AVAILABLE:
+        return {}
+    
+    sections = {}
+    try:
+        with open(elf_path, 'rb') as f:
+            elf = ELFFile(f)
+            for section in elf.iter_sections():
+                name = section.name
+                if name:  # Skip empty names
+                    sections[name] = {
+                        "size": section['sh_size'],
+                        "offset": section['sh_offset'],
+                        "addr": section['sh_addr'],
+                        "type": section['sh_type'],
+                        "flags": section['sh_flags'],
+                    }
+    except Exception:
+        pass  # Will be handled by caller
+    
+    return sections
+
+
+def parse_elf_symbols(elf_path: Path) -> list[dict]:
+    """
+    Parse ELF symbols using pyelftools.
+    Returns list of symbol dicts.
+    """
+    if not PYELFTOOLS_AVAILABLE:
+        return []
+    
+    symbols = []
+    try:
+        with open(elf_path, 'rb') as f:
+            elf = ELFFile(f)
+            
+            # Find symbol table sections
+            for section in elf.iter_sections():
+                if not isinstance(section, SymbolTableSection):
+                    continue
+                
+                for idx, sym in enumerate(section.iter_symbols()):
+                    name = sym.name
+                    if not name:
+                        continue
+                    
+                    # Get section index - handle special values
+                    shndx = sym['st_shndx']
+                    if isinstance(shndx, str):
+                        ndx = shndx  # 'SHN_UNDEF', 'SHN_ABS', etc.
+                    else:
+                        ndx = str(shndx)
+                    
+                    symbols.append({
+                        "num": idx,
+                        "name": name,
+                        "value": sym['st_value'],
+                        "value_hex": f"0x{sym['st_value']:08X}",
+                        "size": sym['st_size'],
+                        "type": sym['st_info']['type'],
+                        "bind": sym['st_info']['bind'],
+                        "vis": sym['st_other']['visibility'],
+                        "ndx": ndx,
+                    })
+    except Exception:
+        pass  # Will be handled by caller
+    
+    return symbols
+
+
+def lib_to_folder(lib: str) -> str:
+    """Convert library name to folder name: LIBC2.LIB -> libc2"""
+    return Path(lib).stem.lower()
+
+
+def obj_to_filename(obj: str) -> str:
+    """Convert object name to filename: ATOI.OBJ -> atoi.o"""
+    return f"{Path(obj).stem.lower()}.o"
+
+
+def enrich_object(o_path: Path, want_sections: list[str] = None) -> dict:
+    """
+    Get ELF data for an object file using pyelftools.
+    Returns dict with sections, section_sizes, symbols, symbol_count, errors.
+    """
+    if want_sections is None:
+        want_sections = [".text", ".data", ".rdata", ".bss", ".sdata", ".sbss"]
+    
+    result = {"errors": [], "obj_path": str(o_path)}
+    
+    if not PYELFTOOLS_AVAILABLE:
+        result["errors"].append("pyelftools not installed - run: pip install pyelftools")
+        result["sections"] = {}
+        result["section_sizes"] = {s: 0 for s in want_sections}
+        result["symbols"] = []
+        result["symbol_count"] = 0
+        return result
+    
+    if not o_path.exists():
+        result["errors"].append(f"missing_object_file: {o_path}")
+        result["sections"] = {}
+        result["section_sizes"] = {s: 0 for s in want_sections}
+        result["symbols"] = []
+        result["symbol_count"] = 0
+        return result
+    
+    # Get sections
+    try:
+        sections = parse_elf_sections(o_path)
+        result["sections"] = sections
+    except Exception as e:
+        result["errors"].append(f"elf_sections_failed: {e}")
+        result["sections"] = {}
+    
+    # Extract just sizes for the summary
+    result["section_sizes"] = {
+        s: result["sections"].get(s, {}).get("size", 0) 
+        for s in want_sections
+    }
+    
+    # Get symbols
+    try:
+        symbols = parse_elf_symbols(o_path)
+        result["symbols"] = symbols
+        result["symbol_count"] = len(symbols)
+    except Exception as e:
+        result["errors"].append(f"elf_symbols_failed: {e}")
+        result["symbols"] = []
+        result["symbol_count"] = 0
+    
+    return result
+
+# =============================================================================
 # Full Binary Scanner
 # =============================================================================
 
@@ -1128,6 +1277,12 @@ class PSYQApp:
         self.scan_show_false_positives = False
         self.scan_binary_fingerprint = ""
         self.fp_store = FalsePositiveStore()
+        
+        # Enrichment (readelf data from .o files)
+        self.enrich_repo_root = ""
+        self.enrich_obj_root = ""  # Resolved path to obj files
+        self.enrich_data: dict[tuple[str, str], dict] = {}  # (library, object) -> readelf info
+        self.enrich_errors: list[str] = []
         
         # Tab 6: Library Explorer
         self.explorer_version_idx = 0
@@ -2054,6 +2209,222 @@ class PSYQApp:
             
             imgui.end_child()
     
+    def render_enrich_tab(self):
+        """Render the enrichment and export tab."""
+        imgui.text("Enrich scan results with ELF section data and export for Splat")
+        imgui.separator()
+        
+        # Check pyelftools availability
+        if not PYELFTOOLS_AVAILABLE:
+            imgui.text_colored(
+                "pyelftools not installed - run: pip install pyelftools",
+                1.0, 0.5, 0.3, 1.0
+            )
+            imgui.text_colored(
+                "This is required for reading ELF object files on all platforms.",
+                0.6, 0.6, 0.6, 1.0
+            )
+            imgui.separator()
+        
+        # Check if we have scan results
+        if not self.scan_results:
+            imgui.text_colored(
+                "No scan results available. Run a scan in the 'Scan Binary' tab first.",
+                0.8, 0.6, 0.3, 1.0
+            )
+            return
+        
+        # Show scan summary
+        fp_count = sum(
+            1 for r in self.scan_results
+            if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+            )
+        )
+        ambiguous_count = sum(1 for r in self.scan_results if r.is_ambiguous)
+        non_fp_ambiguous = sum(
+            1 for r in self.scan_results
+            if r.is_ambiguous and not (
+                self.scan_binary_fingerprint
+                and self.fp_store.is_false_positive(
+                    self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+                )
+            )
+        )
+        valid_count = len(self.scan_results) - fp_count
+        
+        imgui.text(f"Scan results: {len(self.scan_results)} objects ({valid_count} valid, {fp_count} marked as FP)")
+        
+        if non_fp_ambiguous > 0:
+            imgui.text_colored(
+                f"Warning: {non_fp_ambiguous} ambiguous entries need resolution before Splat export",
+                1.0, 0.7, 0.3, 1.0
+            )
+            imgui.text_colored(
+                "Mark false positives (X button) in Scan Binary tab, or filter to a single SDK version",
+                0.6, 0.6, 0.6, 1.0
+            )
+        
+        version_filter = None
+        if self.scan_version_idx > 0 and self.versions:
+            version_filter = self.versions[self.scan_version_idx - 1]
+            imgui.text(f"SDK Version filter: {version_filter}")
+        else:
+            imgui.text_colored(
+                "Tip: Select a specific SDK version in Scan Binary tab for best results",
+                0.6, 0.6, 0.6, 1.0
+            )
+        
+        imgui.separator()
+        
+        # === Enrichment Section ===
+        imgui.text_colored("Step 1: Enrich with ELF data", 0.4, 0.8, 1.0, 1.0)
+        
+        imgui.text("PSY-Q Object Files Root:")
+        imgui.same_line()
+        imgui.text_colored("(?)", 0.5, 0.5, 0.5, 1.0)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Path to directory containing PSY-Q .o files.\n"
+                "Expected structures:\n"
+                "  {root}/assets/psyq/{version}/obj/{lib}/{obj}.o  (decomp project)\n"
+                "  {root}/{version}/obj/{lib}/{obj}.o              (standalone)\n"
+                "Example: ~/chrono-cross-decomp or ~/psyq"
+            )
+        
+        _, self.enrich_repo_root = imgui.input_text(
+            "##enrich_repo_root", self.enrich_repo_root, 512
+        )
+        
+        # Enrich button
+        if PYELFTOOLS_AVAILABLE and self.enrich_repo_root and version_filter:
+            if imgui.button("Enrich with ELF data", width=180):
+                self._do_enrich()
+            
+            if self.enrich_data:
+                imgui.same_line()
+                imgui.text_colored(
+                    f"Enriched: {len(self.enrich_data)} objects",
+                    0.3, 1.0, 0.3, 1.0
+                )
+                if self.enrich_errors:
+                    imgui.same_line()
+                    imgui.text_colored(
+                        f"({len(self.enrich_errors)} errors)",
+                        1.0, 0.5, 0.3, 1.0
+                    )
+                    if imgui.is_item_hovered():
+                        # Show first few errors in tooltip
+                        error_text = "\n".join(self.enrich_errors[:5])
+                        if len(self.enrich_errors) > 5:
+                            error_text += f"\n... and {len(self.enrich_errors) - 5} more"
+                        imgui.set_tooltip(error_text)
+        elif not PYELFTOOLS_AVAILABLE:
+            imgui.text_colored(
+                "Install pyelftools to enable enrichment",
+                0.5, 0.5, 0.5, 1.0
+            )
+        elif not version_filter:
+            imgui.text_colored(
+                "Select a specific SDK version in Scan Binary tab to enable enrichment",
+                0.5, 0.5, 0.5, 1.0
+            )
+        else:
+            imgui.text_colored(
+                "Enter PSY-Q object files path above",
+                0.5, 0.5, 0.5, 1.0
+            )
+        
+        imgui.separator()
+        
+        # === Export Section ===
+        imgui.text_colored("Step 2: Export", 0.4, 0.8, 1.0, 1.0)
+        
+        # Export Splat YAML
+        can_export_splat = (
+            self.scan_results
+            and non_fp_ambiguous == 0
+        )
+        
+        if can_export_splat:
+            if imgui.button("Export Splat YAML", width=180):
+                self._export_splat_yaml()
+            imgui.same_line()
+            imgui.text_colored("(.text with offsets, .data/.rdata/.bss with auto)", 0.5, 0.5, 0.5, 1.0)
+        else:
+            imgui.text_colored(
+                "Resolve all ambiguities to enable Splat export",
+                0.5, 0.5, 0.5, 1.0
+            )
+        
+        # Also show enriched JSON export
+        if imgui.button("Export Enriched JSON", width=180):
+            self._export_scan_results_json()
+        imgui.same_line()
+        imgui.text_colored("(includes section sizes and symbols if enriched)", 0.5, 0.5, 0.5, 1.0)
+        
+        imgui.separator()
+        
+        # === Enrichment Preview ===
+        if self.enrich_data:
+            imgui.text_colored("Enrichment Preview:", 0.4, 0.8, 1.0, 1.0)
+            
+            imgui.begin_child("enrich_preview", 0, 250, border=True)
+            
+            # Header
+            imgui.columns(6, "enrich_cols")
+            imgui.set_column_width(0, 120)  # Library
+            imgui.set_column_width(1, 120)  # Object
+            imgui.set_column_width(2, 70)   # .text
+            imgui.set_column_width(3, 70)   # .data
+            imgui.set_column_width(4, 70)   # .rdata
+            imgui.set_column_width(5, 70)   # .bss
+            imgui.text("Library")
+            imgui.next_column()
+            imgui.text("Object")
+            imgui.next_column()
+            imgui.text(".text")
+            imgui.next_column()
+            imgui.text(".data")
+            imgui.next_column()
+            imgui.text(".rdata")
+            imgui.next_column()
+            imgui.text(".bss")
+            imgui.columns(1)
+            imgui.separator()
+            
+            # Data rows
+            for (lib, obj), info in sorted(self.enrich_data.items()):
+                sizes = info.get("section_sizes", {})
+                imgui.columns(6, f"enrich_{lib}_{obj}")
+                imgui.set_column_width(0, 120)
+                imgui.set_column_width(1, 120)
+                imgui.set_column_width(2, 70)
+                imgui.set_column_width(3, 70)
+                imgui.set_column_width(4, 70)
+                imgui.set_column_width(5, 70)
+                
+                imgui.text(lib)
+                imgui.next_column()
+                imgui.text(obj)
+                imgui.next_column()
+                
+                text_size = sizes.get(".text", 0)
+                data_size = sizes.get(".data", 0)
+                rdata_size = sizes.get(".rdata", 0)
+                bss_size = sizes.get(".bss", 0)
+                
+                imgui.text(f"0x{text_size:X}" if text_size else "-")
+                imgui.next_column()
+                imgui.text(f"0x{data_size:X}" if data_size else "-")
+                imgui.next_column()
+                imgui.text(f"0x{rdata_size:X}" if rdata_size else "-")
+                imgui.next_column()
+                imgui.text(f"0x{bss_size:X}" if bss_size else "-")
+                imgui.columns(1)
+            
+            imgui.end_child()
+    
     def _do_scan_preprocess(self):
         """Preprocess signatures for scanning."""
         library_filter = None
@@ -2289,6 +2660,11 @@ class PSYQApp:
                         for vg in r.version_groups
                     ]
                 
+                # Add enrichment data if available
+                key = (r.library, r.object_name)
+                if key in self.enrich_data:
+                    result_obj["readelf"] = self.enrich_data[key]
+                
                 results_list.append(result_obj)
                 exported += 1
             
@@ -2300,11 +2676,222 @@ class PSYQApp:
                 "objects": results_list
             }
             
+            # Add enrichment metadata if available
+            if self.enrich_data:
+                output["enriched"] = {
+                    "enriched_objects": len(self.enrich_data),
+                    "repo_root": self.enrich_repo_root,
+                    "obj_root": self.enrich_obj_root,
+                    "sections_summary": [".text", ".data", ".rdata", ".bss", ".sdata", ".sbss"],
+                    "errors": self.enrich_errors[:10] if self.enrich_errors else [],
+                    "notes": "Per-object metadata added under objects[i].readelf"
+                }
+            
             with open(export_path, "w") as f:
                 json.dump(output, f, indent=2)
             
             fp_msg = f" ({skipped_fp} false positives excluded)" if skipped_fp else ""
             self.status_message = f"Exported {exported} results to {export_path}{fp_msg}"
+        except Exception as e:
+            self.status_message = f"Export failed: {e}"
+    
+    def _do_enrich(self):
+        """Enrich scan results with readelf data from .o files."""
+        if not self.enrich_repo_root or not self.scan_results:
+            return
+        
+        version_filter = None
+        if self.scan_version_idx > 0 and self.versions:
+            version_filter = self.versions[self.scan_version_idx - 1]
+        
+        if not version_filter:
+            self.status_message = "Select a specific SDK version for enrichment"
+            return
+        
+        repo_root = Path(self.enrich_repo_root).expanduser()
+        
+        # Try multiple path structures:
+        # 1. {root}/assets/psyq/{version}/obj/  (decomp project structure)
+        # 2. {root}/{version}/obj/              (standalone SDK structure)
+        # 3. {root}/obj/                        (flat structure)
+        possible_roots = [
+            repo_root / "assets" / "psyq" / version_filter / "obj",
+            repo_root / version_filter / "obj",
+            repo_root / "obj",
+        ]
+        
+        obj_root = None
+        for candidate in possible_roots:
+            if candidate.exists():
+                obj_root = candidate
+                break
+        
+        if not obj_root:
+            tried = ", ".join(str(p) for p in possible_roots)
+            self.status_message = f"Object directory not found. Tried: {tried}"
+            return
+        
+        self.enrich_obj_root = str(obj_root)
+        self.enrich_data = {}
+        self.enrich_errors = []
+        enriched = 0
+        
+        for r in self.scan_results:
+            # Skip false positives
+            if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+            ):
+                continue
+            
+            key = (r.library, r.object_name)
+            if key in self.enrich_data:
+                continue  # Already processed
+            
+            lib_folder = lib_to_folder(r.library)
+            obj_file = obj_to_filename(r.object_name)
+            o_path = obj_root / lib_folder / obj_file
+            
+            info = enrich_object(o_path)
+            self.enrich_data[key] = info
+            
+            if info.get("errors"):
+                self.enrich_errors.extend(info["errors"])
+            else:
+                enriched += 1
+        
+        self.status_message = f"Enriched {enriched} objects from {obj_root}"
+    
+    def _export_splat_yaml(self):
+        """Export scan results as Splat YAML subsegments."""
+        if not self.scan_results:
+            return
+        
+        # Default export path next to the binary
+        if self.scan_binary_path:
+            base = os.path.splitext(self.scan_binary_path)[0]
+            export_path = f"{base}_splat_subsegments.yaml"
+        else:
+            export_path = "splat_subsegments.yaml"
+        
+        # Collect non-FP results sorted by offset
+        valid_results = []
+        for r in self.scan_results:
+            if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+            ):
+                continue
+            if r.is_ambiguous:
+                # Skip ambiguous - should have been resolved
+                continue
+            valid_results.append(r)
+        
+        # Sort by offset - this order is used for ALL sections
+        valid_results.sort(key=lambda r: r.offset)
+        
+        # Get version filter for comments
+        version_filter = None
+        if self.scan_version_idx > 0 and self.versions:
+            version_filter = self.versions[self.scan_version_idx - 1]
+        
+        try:
+            with open(export_path, "w") as f:
+                f.write(f"# PSY-Q Splat Subsegments\n")
+                f.write(f"# Binary: {self.scan_binary_path}\n")
+                f.write(f"# SDK Version: {version_filter or 'mixed'}\n")
+                f.write(f"# Objects: {len(valid_results)}\n")
+                f.write(f"#\n")
+                f.write(f"# Format: [offset, type, library, object, section]\n")
+                f.write(f"# Note: Order matches binary layout (sorted by .text offset)\n")
+                f.write(f"#\n\n")
+                
+                # .text segments (with actual offsets, in offset order)
+                f.write("      # === .text segments ===\n")
+                for r in valid_results:
+                    obj_stem = Path(r.object_name).stem
+                    lib_name = r.library.replace('.LIB', '')
+                    f.write(f"      - [0x{r.offset:X}, lib, {lib_name}, {obj_stem}, .text]\n")
+                
+                # .data segments (auto offsets, SAME order as .text)
+                has_any_data = any(
+                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".data", 0) > 0
+                    for r in valid_results
+                )
+                if has_any_data:
+                    f.write("\n      # === .data segments ===\n")
+                    for r in valid_results:
+                        key = (r.library, r.object_name)
+                        info = self.enrich_data.get(key, {})
+                        data_size = info.get("section_sizes", {}).get(".data", 0)
+                        if data_size > 0:
+                            obj_stem = Path(r.object_name).stem
+                            lib_name = r.library.replace('.LIB', '')
+                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .data]  # size: 0x{data_size:X}\n")
+                
+                # .rdata segments (SAME order)
+                has_any_rdata = any(
+                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".rdata", 0) > 0
+                    for r in valid_results
+                )
+                if has_any_rdata:
+                    f.write("\n      # === .rdata segments ===\n")
+                    for r in valid_results:
+                        key = (r.library, r.object_name)
+                        info = self.enrich_data.get(key, {})
+                        rdata_size = info.get("section_sizes", {}).get(".rdata", 0)
+                        if rdata_size > 0:
+                            obj_stem = Path(r.object_name).stem
+                            lib_name = r.library.replace('.LIB', '')
+                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .rdata]  # size: 0x{rdata_size:X}\n")
+                
+                # .sdata segments (SAME order)
+                has_any_sdata = any(
+                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".sdata", 0) > 0
+                    for r in valid_results
+                )
+                if has_any_sdata:
+                    f.write("\n      # === .sdata segments ===\n")
+                    for r in valid_results:
+                        key = (r.library, r.object_name)
+                        info = self.enrich_data.get(key, {})
+                        sdata_size = info.get("section_sizes", {}).get(".sdata", 0)
+                        if sdata_size > 0:
+                            obj_stem = Path(r.object_name).stem
+                            lib_name = r.library.replace('.LIB', '')
+                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .sdata]  # size: 0x{sdata_size:X}\n")
+                
+                # .sbss segments (SAME order)
+                has_any_sbss = any(
+                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".sbss", 0) > 0
+                    for r in valid_results
+                )
+                if has_any_sbss:
+                    f.write("\n      # === .sbss segments ===\n")
+                    for r in valid_results:
+                        key = (r.library, r.object_name)
+                        info = self.enrich_data.get(key, {})
+                        sbss_size = info.get("section_sizes", {}).get(".sbss", 0)
+                        if sbss_size > 0:
+                            obj_stem = Path(r.object_name).stem
+                            lib_name = r.library.replace('.LIB', '')
+                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .sbss]  # size: 0x{sbss_size:X}\n")
+                
+                # .bss segments (SAME order)
+                has_any_bss = any(
+                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".bss", 0) > 0
+                    for r in valid_results
+                )
+                if has_any_bss:
+                    f.write("\n      # === .bss segments ===\n")
+                    for r in valid_results:
+                        key = (r.library, r.object_name)
+                        info = self.enrich_data.get(key, {})
+                        bss_size = info.get("section_sizes", {}).get(".bss", 0)
+                        if bss_size > 0:
+                            obj_stem = Path(r.object_name).stem
+                            lib_name = r.library.replace('.LIB', '')
+                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .bss]  # size: 0x{bss_size:X}\n")
+            
+            self.status_message = f"Exported Splat YAML to {export_path}"
         except Exception as e:
             self.status_message = f"Export failed: {e}"
     
@@ -2600,6 +3187,9 @@ class PSYQApp:
             self.scan_library_idx = 0
             self.scan_preprocessed = False
             self.scan_results = []
+            self.enrich_data = {}
+            self.enrich_errors = []
+            self.enrich_obj_root = ""
             self._init_versions()
             self.status_message = "Cache cleared"
         
@@ -2648,6 +3238,10 @@ class PSYQApp:
             
             if imgui.begin_tab_item("Scan Binary")[0]:
                 self.render_scan_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Enrich & Export")[0]:
+                self.render_enrich_tab()
                 imgui.end_tab_item()
             
             if imgui.begin_tab_item("Library Explorer")[0]:
