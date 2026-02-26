@@ -335,14 +335,16 @@ class FalsePositiveStore:
     
     Keyed by a binary fingerprint (fast hash of size + head + tail) so
     dismissals are tied to a specific binary and survive across sessions.
-    Each entry is (offset, library, object_name).
+    Each entry is (offset, library, object_name, optional version_extra).
+    The version_extra allows marking specific version groups of ambiguous
+    results as false positives without affecting other version groups.
     """
     
     FILENAME = "false_positives.json"
     
     def __init__(self, cache_dir: Path = CACHE_DIR):
         self.cache_dir = cache_dir
-        self._store: dict[str, list[dict]] = {}  # fingerprint -> [{offset, library, object}]
+        self._store: dict[str, list[dict]] = {}  # fingerprint -> [{offset, library, object, version_extra?}]
         self._load()
     
     def _store_path(self) -> Path:
@@ -384,31 +386,52 @@ class FalsePositiveStore:
             # Fallback: use filename + size
             return hashlib.sha256(binary_path.encode()).hexdigest()[:16]
     
-    def is_false_positive(self, fingerprint: str, offset: int, library: str, object_name: str) -> bool:
+    def is_false_positive(self, fingerprint: str, offset: int, library: str, object_name: str, version_extra: str = None) -> bool:
         entries = self._store.get(fingerprint, [])
-        return any(
-            e["offset"] == offset and e["library"] == library and e["object"] == object_name
-            for e in entries
-        )
+        for e in entries:
+            if e["offset"] == offset and e["library"] == library and e["object"] == object_name:
+                # If we have a version_extra, check if it matches
+                e_extra = e.get("version_extra")
+                if version_extra is None and e_extra is None:
+                    return True
+                if version_extra is not None and e_extra == version_extra:
+                    return True
+                # Also match if the entry has no version_extra (marks all groups)
+                if e_extra is None and version_extra is not None:
+                    return True
+        return False
     
-    def mark(self, fingerprint: str, offset: int, library: str, object_name: str) -> None:
+    def mark(self, fingerprint: str, offset: int, library: str, object_name: str, version_extra: str = None) -> None:
         if fingerprint not in self._store:
             self._store[fingerprint] = []
         # Don't double-add
-        if not self.is_false_positive(fingerprint, offset, library, object_name):
-            self._store[fingerprint].append({
+        if not self.is_false_positive(fingerprint, offset, library, object_name, version_extra):
+            entry = {
                 "offset": offset,
                 "library": library,
                 "object": object_name,
-            })
+            }
+            if version_extra is not None:
+                entry["version_extra"] = version_extra
+            self._store[fingerprint].append(entry)
             self._save()
     
-    def unmark(self, fingerprint: str, offset: int, library: str, object_name: str) -> None:
+    def unmark(self, fingerprint: str, offset: int, library: str, object_name: str, version_extra: str = None) -> None:
         entries = self._store.get(fingerprint, [])
-        self._store[fingerprint] = [
-            e for e in entries
-            if not (e["offset"] == offset and e["library"] == library and e["object"] == object_name)
-        ]
+        new_entries = []
+        for e in entries:
+            keep = True
+            if e["offset"] == offset and e["library"] == library and e["object"] == object_name:
+                e_extra = e.get("version_extra")
+                # Match if both None, or both have same value
+                if version_extra is None and e_extra is None:
+                    keep = False
+                elif version_extra is not None and e_extra == version_extra:
+                    keep = False
+            if keep:
+                new_entries.append(e)
+        
+        self._store[fingerprint] = new_entries
         if not self._store[fingerprint]:
             del self._store[fingerprint]
         self._save()
@@ -728,6 +751,62 @@ def parse_elf_symbols(elf_path: Path) -> list[dict]:
     return symbols
 
 
+def parse_elf_relocations(elf_path: Path) -> dict[str, list[int]]:
+    """
+    Parse ELF relocation sections using pyelftools.
+    Returns dict of target_section -> list of offsets that need wildcarding.
+    
+    For example:
+    {
+        ".data": [0, 4, 16],      # Offsets in .data that have relocations
+        ".rdata": [8, 12],        # Offsets in .rdata that have relocations
+    }
+    
+    Relocations are typically 4 bytes (32-bit pointers on MIPS).
+    """
+    if not PYELFTOOLS_AVAILABLE:
+        return {}
+    
+    relocs: dict[str, list[int]] = {}
+    
+    try:
+        from elftools.elf.relocation import RelocationSection
+        
+        with open(elf_path, 'rb') as f:
+            elf = ELFFile(f)
+            
+            for section in elf.iter_sections():
+                # Look for relocation sections
+                if not isinstance(section, RelocationSection):
+                    continue
+                
+                # Get the name of the section this applies to
+                # .rel.data applies to .data, .rel.rdata applies to .rdata, etc.
+                section_name = section.name
+                if section_name.startswith('.rel.'):
+                    target_section = '.' + section_name[5:]  # .rel.data -> .data
+                elif section_name.startswith('.rela.'):
+                    target_section = '.' + section_name[6:]  # .rela.data -> .data
+                else:
+                    continue
+                
+                if target_section not in relocs:
+                    relocs[target_section] = []
+                
+                # Extract relocation offsets
+                for reloc in section.iter_relocations():
+                    offset = reloc['r_offset']
+                    relocs[target_section].append(offset)
+                
+                # Sort offsets for easier processing
+                relocs[target_section].sort()
+    
+    except Exception:
+        pass  # Will be handled by caller
+    
+    return relocs
+
+
 def lib_to_folder(lib: str) -> str:
     """Convert library name to folder name: LIBC2.LIB -> libc2"""
     return Path(lib).stem.lower()
@@ -741,7 +820,7 @@ def obj_to_filename(obj: str) -> str:
 def enrich_object(o_path: Path, want_sections: list[str] = None) -> dict:
     """
     Get ELF data for an object file using pyelftools.
-    Returns dict with sections, section_sizes, symbols, symbol_count, errors.
+    Returns dict with sections, section_sizes, symbols, symbol_count, relocations, errors.
     """
     if want_sections is None:
         want_sections = [".text", ".data", ".rdata", ".bss", ".sdata", ".sbss"]
@@ -754,6 +833,7 @@ def enrich_object(o_path: Path, want_sections: list[str] = None) -> dict:
         result["section_sizes"] = {s: 0 for s in want_sections}
         result["symbols"] = []
         result["symbol_count"] = 0
+        result["relocations"] = {}
         return result
     
     if not o_path.exists():
@@ -762,6 +842,7 @@ def enrich_object(o_path: Path, want_sections: list[str] = None) -> dict:
         result["section_sizes"] = {s: 0 for s in want_sections}
         result["symbols"] = []
         result["symbol_count"] = 0
+        result["relocations"] = {}
         return result
     
     # Get sections
@@ -787,6 +868,14 @@ def enrich_object(o_path: Path, want_sections: list[str] = None) -> dict:
         result["errors"].append(f"elf_symbols_failed: {e}")
         result["symbols"] = []
         result["symbol_count"] = 0
+    
+    # Get relocations
+    try:
+        relocations = parse_elf_relocations(o_path)
+        result["relocations"] = relocations
+    except Exception as e:
+        result["errors"].append(f"elf_relocations_failed: {e}")
+        result["relocations"] = {}
     
     return result
 
@@ -825,6 +914,10 @@ class ScanResult:
     version_groups: list[VersionGroup]  # One group if unambiguous, multiple if subsumed
     labels: list[Label]  # Functions within this object
     is_ambiguous: bool = False  # True if multiple version groups due to subsumption
+    is_duplicate: bool = False  # True if same (library, object) found at another offset
+    duplicate_offsets: list[int] = field(default_factory=list)  # Other offsets where this object was found
+    is_overlap: bool = False  # True if different (library, object) pairs at same offset
+    overlap_objects: list[tuple[str, str]] = field(default_factory=list)  # [(library, object), ...] at same offset
 
     @property
     def versions(self) -> list[str]:
@@ -1121,6 +1214,55 @@ class ScanEngine:
         merged.sort(key=lambda r: r.offset)
         return merged
     
+    def _mark_duplicates(self, results: list[ScanResult]) -> list[ScanResult]:
+        """
+        Mark results where the same (library, object) appears at multiple offsets.
+        These are likely false positives where only one is the real match.
+        """
+        from collections import defaultdict
+        
+        # Group by (library, object_name)
+        by_obj: dict[tuple[str, str], list[ScanResult]] = defaultdict(list)
+        for r in results:
+            by_obj[(r.library, r.object_name)].append(r)
+        
+        # Mark duplicates
+        for key, obj_results in by_obj.items():
+            if len(obj_results) > 1:
+                # Multiple matches for same object - mark all as duplicates
+                all_offsets = [r.offset for r in obj_results]
+                for r in obj_results:
+                    r.is_duplicate = True
+                    r.duplicate_offsets = [o for o in all_offsets if o != r.offset]
+        
+        return results
+    
+    def _mark_overlaps(self, results: list[ScanResult]) -> list[ScanResult]:
+        """
+        Mark results where different (library, object) pairs are at the same offset.
+        This can happen when identical code exists in multiple libraries (e.g., strtok).
+        """
+        from collections import defaultdict
+        
+        # Group by offset
+        by_offset: dict[int, list[ScanResult]] = defaultdict(list)
+        for r in results:
+            by_offset[r.offset].append(r)
+        
+        # Mark overlaps
+        for offset, results_at_offset in by_offset.items():
+            if len(results_at_offset) > 1:
+                # Multiple different objects at same offset
+                all_objs = [(r.library, r.object_name) for r in results_at_offset]
+                for r in results_at_offset:
+                    r.is_overlap = True
+                    r.overlap_objects = [
+                        (lib, obj) for lib, obj in all_objs 
+                        if (lib, obj) != (r.library, r.object_name)
+                    ]
+        
+        return results
+    
     def scan(self, binary_path: str, align: int = 4) -> list[ScanResult]:
         """
         Scan a binary file for all matching PSY-Q object signatures.
@@ -1206,10 +1348,20 @@ class ScanEngine:
         # Sort by offset
         results.sort(key=lambda r: r.offset)
         
+        # Detect duplicates (same library+object at multiple offsets)
+        results = self._mark_duplicates(results)
+        
+        # Detect overlaps (different objects at same offset)
+        results = self._mark_overlaps(results)
+        
         self._progress_pct = 1.0
         ambiguous_count = sum(1 for r in results if r.is_ambiguous)
+        duplicate_count = sum(1 for r in results if r.is_duplicate)
+        overlap_count = sum(1 for r in results if r.is_overlap)
         ambig_msg = f" ({ambiguous_count} ambiguous)" if ambiguous_count else ""
-        self._progress_message = f"Scan complete: {len(results)} objects found{ambig_msg}"
+        dup_msg = f" ({duplicate_count} duplicates)" if duplicate_count else ""
+        overlap_msg = f" ({overlap_count} overlaps)" if overlap_count else ""
+        self._progress_message = f"Scan complete: {len(results)} objects found{ambig_msg}{dup_msg}{overlap_msg}"
         
         return results
 
@@ -2078,16 +2230,50 @@ class PSYQApp:
                         or any(filter_lower in v for v in r.versions)
                         or any(filter_lower in lbl.name.lower() for lbl in r.labels)
                         or (filter_lower == "ambiguous" and r.is_ambiguous)
+                        or (filter_lower == "duplicate" and r.is_duplicate)
+                        or (filter_lower == "overlap" and r.is_overlap)
                         or (filter_lower == "false positive" and is_fp)
                     ):
                         continue
                 
-                filtered.append((r, is_fp))
+                # For ambiguous results, expand into separate lines (one per version group)
+                # so user can mark individual groups as false positive
+                if r.is_ambiguous and len(r.version_groups) > 1:
+                    for vg_idx, vg in enumerate(r.version_groups):
+                        # Create a pseudo-key for FP tracking that includes version group
+                        vg_versions_str = ",".join(sorted(vg.versions))
+                        is_vg_fp = (
+                            self.scan_binary_fingerprint
+                            and self.fp_store.is_false_positive(
+                                self.scan_binary_fingerprint, 
+                                r.offset, r.library, r.object_name,
+                                vg_versions_str
+                            )
+                        )
+                        if is_vg_fp and not self.scan_show_false_positives:
+                            continue
+                        filtered.append((r, is_vg_fp, vg_idx, vg))
+                else:
+                    filtered.append((r, is_fp, -1, None))
             
-            imgui.text(f"Showing {len(filtered)} of {len(self.scan_results)} results")
+            # Count stats
+            ambiguous_lines = sum(1 for f in filtered if f[2] >= 0)
+            duplicate_count = sum(1 for f in filtered if f[0].is_duplicate)
+            overlap_count = sum(1 for f in filtered if f[0].is_overlap)
+            
+            imgui.text(f"Showing {len(filtered)} lines ({len(self.scan_results)} objects)")
+            if ambiguous_lines > 0:
+                imgui.same_line()
+                imgui.text_colored(f"[{ambiguous_lines} ambiguous]", 1.0, 0.9, 0.3, 1.0)
+            if duplicate_count > 0:
+                imgui.same_line()
+                imgui.text_colored(f"[{duplicate_count} duplicates]", 1.0, 0.6, 0.3, 1.0)
+            if overlap_count > 0:
+                imgui.same_line()
+                imgui.text_colored(f"[{overlap_count} overlaps]", 0.9, 0.4, 0.9, 1.0)
             imgui.same_line()
             imgui.text_colored(
-                "(filter 'ambiguous' or 'false positive')",
+                "(filter: 'ambiguous', 'duplicate', 'overlap', 'false positive')",
                 0.5, 0.5, 0.5, 1.0
             )
             
@@ -2114,8 +2300,23 @@ class PSYQApp:
             imgui.columns(1)
             imgui.separator()
             
-            for result, is_fp in filtered:
-                row_id = f"scan_{result.offset:X}_{result.object_name}"
+            for entry in filtered:
+                result, is_fp, vg_idx, vg = entry
+                is_ambiguous_line = vg_idx >= 0
+                
+                # For ambiguous lines, use a version-specific key
+                if is_ambiguous_line:
+                    vg_versions_str = ",".join(sorted(vg.versions))
+                    row_id = f"scan_{result.offset:X}_{result.object_name}_{vg_idx}"
+                    fp_extra = vg_versions_str
+                    display_versions = vg.versions
+                    display_size = vg.sig_length
+                else:
+                    row_id = f"scan_{result.offset:X}_{result.object_name}"
+                    fp_extra = None
+                    display_versions = result.versions
+                    display_size = result.sig_length
+                
                 imgui.columns(6, row_id)
                 imgui.set_column_width(0, 35)
                 imgui.set_column_width(1, 90)
@@ -2128,7 +2329,8 @@ class PSYQApp:
                     if imgui.small_button(f"+##{row_id}"):
                         self.fp_store.unmark(
                             self.scan_binary_fingerprint,
-                            result.offset, result.library, result.object_name
+                            result.offset, result.library, result.object_name,
+                            fp_extra
                         )
                     if imgui.is_item_hovered():
                         imgui.set_tooltip("Restore (unmark as false positive)")
@@ -2136,16 +2338,22 @@ class PSYQApp:
                     if imgui.small_button(f"X##{row_id}"):
                         self.fp_store.mark(
                             self.scan_binary_fingerprint,
-                            result.offset, result.library, result.object_name
+                            result.offset, result.library, result.object_name,
+                            fp_extra
                         )
                     if imgui.is_item_hovered():
                         imgui.set_tooltip("Mark as false positive")
                 imgui.next_column()
                 
-                # Offset — yellow if ambiguous, red+strikethrough-ish if FP
+                # Offset — color coded by status
+                # Magenta for overlap, orange for duplicate, yellow for ambiguous, gray for FP
                 if is_fp:
                     imgui.text_colored(f"0x{result.offset:08X}", 0.5, 0.5, 0.5, 1.0)
-                elif result.is_ambiguous:
+                elif result.is_overlap:
+                    imgui.text_colored(f"0x{result.offset:08X}", 0.9, 0.4, 0.9, 1.0)
+                elif result.is_duplicate:
+                    imgui.text_colored(f"0x{result.offset:08X}", 1.0, 0.6, 0.3, 1.0)
+                elif is_ambiguous_line:
                     imgui.text_colored(f"0x{result.offset:08X}", 1.0, 0.9, 0.3, 1.0)
                 else:
                     imgui.text(f"0x{result.offset:08X}")
@@ -2164,43 +2372,60 @@ class PSYQApp:
                 imgui.next_column()
                 
                 # Size column
-                if result.is_ambiguous:
-                    sizes = sorted(set(vg.sig_length for vg in result.version_groups))
-                    if len(sizes) > 1:
-                        size_text = f"0x{sizes[0]:X}-0x{sizes[-1]:X}"
-                    else:
-                        size_text = f"0x{sizes[0]:X}"
-                    if is_fp:
-                        imgui.text_colored(size_text, 0.5, 0.5, 0.5, 1.0)
-                    else:
-                        imgui.text_colored(size_text, 1.0, 0.9, 0.3, 1.0)
+                size_text = f"0x{display_size:X}"
+                if is_fp:
+                    imgui.text_colored(size_text, 0.5, 0.5, 0.5, 1.0)
+                elif is_ambiguous_line:
+                    imgui.text_colored(size_text, 1.0, 0.9, 0.3, 1.0)
                 else:
-                    size_text = f"0x{result.sig_length:X}"
-                    if is_fp:
-                        imgui.text_colored(size_text, 0.5, 0.5, 0.5, 1.0)
-                    else:
-                        imgui.text(size_text)
+                    imgui.text(size_text)
                 imgui.next_column()
                 
-                # Versions column
+                # Versions column - with dynamic overlap/duplicate checking
                 if is_fp:
                     imgui.text_colored("[FALSE POSITIVE]", 0.5, 0.5, 0.5, 1.0)
-                    version_str = ", ".join(result.versions)
+                    version_str = ", ".join(display_versions)
                     imgui.text_colored(f"  {version_str}", 0.4, 0.4, 0.4, 1.0)
-                elif result.is_ambiguous:
-                    imgui.text_colored("[AMBIGUOUS - signature prefix overlap]", 1.0, 0.9, 0.3, 1.0)
-                    for vg in result.version_groups:
-                        version_str = ", ".join(vg.versions)
-                        imgui.text_colored(
-                            f"  0x{vg.sig_length:X} bytes: {version_str}",
-                            0.9, 0.85, 0.5, 1.0
-                        )
                 else:
-                    version_str = ", ".join(result.versions)
-                    imgui.text_wrapped(version_str)
+                    # Check for active (non-FP) overlaps
+                    active_overlaps = []
+                    if result.is_overlap:
+                        for lib, obj in result.overlap_objects:
+                            if not self.fp_store.is_false_positive(
+                                self.scan_binary_fingerprint, result.offset, lib, obj
+                            ):
+                                active_overlaps.append((lib, obj))
+                    
+                    # Check for active (non-FP) duplicates
+                    active_duplicates = []
+                    if result.is_duplicate:
+                        for dup_offset in result.duplicate_offsets:
+                            if not self.fp_store.is_false_positive(
+                                self.scan_binary_fingerprint, dup_offset, result.library, result.object_name
+                            ):
+                                active_duplicates.append(dup_offset)
+                    
+                    # Show status based on what's still active
+                    if active_overlaps:
+                        overlap_str = ", ".join(f"{lib}/{obj}" for lib, obj in active_overlaps)
+                        imgui.text_colored(f"[OVERLAP - same addr as {overlap_str}]", 0.9, 0.4, 0.9, 1.0)
+                        version_str = ", ".join(display_versions)
+                        imgui.text_wrapped(version_str)
+                    elif active_duplicates:
+                        other_offsets = ", ".join(f"0x{o:X}" for o in active_duplicates)
+                        imgui.text_colored(f"[DUPLICATE - also at {other_offsets}]", 1.0, 0.6, 0.3, 1.0)
+                        version_str = ", ".join(display_versions)
+                        imgui.text_wrapped(version_str)
+                    elif is_ambiguous_line:
+                        imgui.text_colored("[AMBIGUOUS - mark others as FP]", 1.0, 0.9, 0.3, 1.0)
+                        version_str = ", ".join(display_versions)
+                        imgui.text_colored(f"  {version_str}", 0.9, 0.85, 0.5, 1.0)
+                    else:
+                        version_str = ", ".join(display_versions)
+                        imgui.text_wrapped(version_str)
                 
-                # Show function labels in this object
-                if not is_fp:
+                # Show function labels in this object (only for non-ambiguous or first ambiguous line)
+                if not is_fp and (not is_ambiguous_line or vg_idx == 0):
                     func_labels = [
                         l for l in result.labels
                         if not (l.name.startswith("loc_") or l.name.startswith("text_"))
@@ -2986,7 +3211,8 @@ class PSYQApp:
         Search binary for a block's .data or .rdata section.
         
         Builds the expected byte pattern from the concatenated section data
-        of all objects in the block, then searches the binary.
+        of all objects in the block, applying wildcard masks at relocation
+        offsets (since relocated values won't match).
         """
         if block_idx >= len(self.blocks):
             return
@@ -3001,8 +3227,12 @@ class PSYQApp:
         self.block_searching = True
         self.block_search_results = []
         
-        # Build expected pattern from ELF section data
+        # Build expected pattern from ELF section data with relocation masks
+        # Each entry: (result, data_bytes, mask_bytes)
+        # mask: 0xFF = concrete byte, 0x00 = wildcard (relocation)
         pattern_parts = []
+        total_relocs = 0
+        
         for r in block["objects"]:
             key = (r.library, r.object_name)
             info = self.enrich_data.get(key, {})
@@ -3016,19 +3246,40 @@ class PSYQApp:
             section_offset = section_info.get("offset", 0)
             section_size = section_info.get("size", 0)
             
-            if section_size > 0:
-                try:
-                    with open(obj_path, "rb") as f:
-                        f.seek(section_offset)
-                        data = f.read(section_size)
-                        pattern_parts.append((r, data))
-                except Exception:
-                    pass
+            if section_size <= 0:
+                continue
+            
+            # Get relocations for this section
+            relocs = info.get("relocations", {}).get(section, [])
+            total_relocs += len(relocs)
+            
+            try:
+                with open(obj_path, "rb") as f:
+                    f.seek(section_offset)
+                    data = f.read(section_size)
+                    
+                    # Build mask: 0xFF for concrete bytes, 0x00 for relocated bytes
+                    # Relocations are typically 4 bytes on MIPS
+                    mask = bytearray(b'\xFF' * section_size)
+                    for reloc_offset in relocs:
+                        if reloc_offset < section_size:
+                            # Wildcard 4 bytes at the relocation offset
+                            for i in range(4):
+                                if reloc_offset + i < section_size:
+                                    mask[reloc_offset + i] = 0x00
+                    
+                    pattern_parts.append((r, data, bytes(mask)))
+            except Exception:
+                pass
         
         if not pattern_parts:
             self.status_message = f"No {section} data found in block {block_idx + 1}"
             self.block_searching = False
             return
+        
+        # Log relocation info
+        if total_relocs > 0:
+            self.status_message = f"Searching {section} with {total_relocs} relocations masked..."
         
         # Read binary
         try:
@@ -3039,49 +3290,71 @@ class PSYQApp:
             self.block_searching = False
             return
         
-        # Search for the first object's section data as anchor
-        first_obj, first_data = pattern_parts[0]
+        # Find a good anchor from the first object's data
+        # Use first N concrete (non-wildcard) bytes as search anchor
+        first_obj, first_data, first_mask = pattern_parts[0]
         
-        # Use first N bytes as search anchor (enough to be unique but not too much)
-        anchor_len = min(32, len(first_data))
-        anchor = first_data[:anchor_len]
+        # Build anchor from concrete bytes only
+        anchor = bytearray()
+        anchor_positions = []  # positions in first_data that are in anchor
+        for i in range(len(first_data)):
+            if first_mask[i] == 0xFF:  # Concrete byte
+                anchor.append(first_data[i])
+                anchor_positions.append(i)
+                if len(anchor) >= 16:  # 16 concrete bytes is enough
+                    break
+        
+        if len(anchor) < 4:
+            self.status_message = f"Not enough concrete bytes in {section} to search (too many relocations)"
+            self.block_searching = False
+            return
+        
+        anchor = bytes(anchor)
+        anchor_start_offset = anchor_positions[0] if anchor_positions else 0
         
         candidates = []
         pos = search_start
         binary_len = len(binary)
         
         while pos < binary_len - len(anchor):
+            # Find the anchor in binary
             found_pos = binary.find(anchor, pos)
             if found_pos == -1:
                 break
             
+            # Calculate the actual start position of the section data
+            section_start = found_pos - anchor_start_offset
+            
             # Check alignment (4-byte)
-            if found_pos % 4 != 0:
+            if section_start < 0 or section_start % 4 != 0:
                 pos = found_pos + 1
                 continue
             
-            # Verify more of the pattern
+            # Verify the full pattern with masked matching
             match_score = 0
-            total_bytes = 0
-            check_offset = found_pos
+            total_concrete_bytes = 0
+            check_offset = section_start
+            valid = True
             
-            for obj, data in pattern_parts:
+            for obj, data, mask in pattern_parts:
                 data_len = len(data)
                 if check_offset + data_len > binary_len:
+                    valid = False
                     break
                 
-                # Count matching bytes
-                for i, b in enumerate(data):
-                    total_bytes += 1
-                    if binary[check_offset + i] == b:
-                        match_score += 1
+                # Count matching concrete bytes (skip wildcards)
+                for i in range(data_len):
+                    if mask[i] == 0xFF:  # Only count concrete bytes
+                        total_concrete_bytes += 1
+                        if binary[check_offset + i] == data[i]:
+                            match_score += 1
                 
                 check_offset += data_len
             
-            if total_bytes > 0:
-                match_pct = (match_score / total_bytes) * 100
+            if valid and total_concrete_bytes > 0:
+                match_pct = (match_score / total_concrete_bytes) * 100
                 if match_pct >= 80:  # Reasonable threshold
-                    candidates.append((found_pos, match_pct))
+                    candidates.append((section_start, match_pct))
             
             pos = found_pos + 1
             
@@ -3096,7 +3369,8 @@ class PSYQApp:
         self.block_searching = False
         
         if candidates:
-            self.status_message = f"Found {len(candidates)} candidate(s) for block {block_idx + 1} {section}"
+            reloc_note = f" ({total_relocs} relocs masked)" if total_relocs else ""
+            self.status_message = f"Found {len(candidates)} candidate(s) for block {block_idx + 1} {section}{reloc_note}"
         else:
             self.status_message = f"No matches found for block {block_idx + 1} {section}"
     
@@ -3151,7 +3425,7 @@ class PSYQApp:
         else:
             export_path = "splat_subsegments.yaml"
         
-        # Collect non-FP results sorted by offset
+        # Collect non-FP, non-ambiguous results sorted by offset
         valid_results = []
         for r in self.scan_results:
             if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
@@ -3159,11 +3433,23 @@ class PSYQApp:
             ):
                 continue
             if r.is_ambiguous:
-                # Skip ambiguous - should have been resolved
+                # For ambiguous, check if all but one version group are FP
+                non_fp_groups = []
+                for vg in r.version_groups:
+                    vg_versions_str = ",".join(sorted(vg.versions))
+                    if not self.fp_store.is_false_positive(
+                        self.scan_binary_fingerprint, r.offset, r.library, r.object_name, vg_versions_str
+                    ):
+                        non_fp_groups.append(vg)
+                
+                # If exactly one group remains, use it
+                if len(non_fp_groups) == 1:
+                    # Create a modified result with just the non-FP group
+                    valid_results.append(r)
+                # Otherwise skip (still ambiguous)
                 continue
             valid_results.append(r)
         
-        # Sort by offset - this order is used for ALL sections
         valid_results.sort(key=lambda r: r.offset)
         
         # Get version filter for comments
@@ -3178,120 +3464,108 @@ class PSYQApp:
         has_resolved_data = bool(data_offsets)
         has_resolved_rdata = bool(rdata_offsets)
         
+        # Build block membership for gap detection
+        # Map result offset -> block_idx
+        result_to_block: dict[int, int] = {}
+        if self.blocks:
+            for block_idx, block in enumerate(self.blocks):
+                for r in block["objects"]:
+                    result_to_block[r.offset] = block_idx
+        
         try:
             with open(export_path, "w") as f:
                 f.write(f"# PSY-Q Splat Subsegments\n")
                 f.write(f"# Binary: {self.scan_binary_path}\n")
                 f.write(f"# SDK Version: {version_filter or 'mixed'}\n")
                 f.write(f"# Objects: {len(valid_results)}\n")
+                f.write(f"# Blocks: {len(self.blocks)}\n")
                 if has_resolved_data or has_resolved_rdata:
                     f.write(f"# .data offsets: {'resolved' if has_resolved_data else 'auto'}\n")
                     f.write(f"# .rdata offsets: {'resolved' if has_resolved_rdata else 'auto'}\n")
                 f.write(f"#\n")
                 f.write(f"# Format: [offset, type, library, object, section]\n")
-                f.write(f"# Note: Order matches binary layout (sorted by .text offset)\n")
                 f.write(f"#\n\n")
                 
-                # .text segments (with actual offsets, in offset order)
+                # === .text segments with asm gaps ===
                 f.write("      # === .text segments ===\n")
+                last_block_idx = -1
+                prev_end = None
+                
                 for r in valid_results:
+                    key = (r.library, r.object_name)
+                    info = self.enrich_data.get(key, {})
+                    text_size = info.get("section_sizes", {}).get(".text", r.sig_length)
+                    
+                    block_idx = result_to_block.get(r.offset, -1)
+                    
+                    # Check if we're starting a new block
+                    if block_idx != last_block_idx and block_idx >= 0:
+                        # Add gap (asm) before this block if we have a previous end
+                        if prev_end is not None and r.offset > prev_end:
+                            gap_size = r.offset - prev_end
+                            if gap_size > 0:
+                                f.write(f"\n      # --- game code (0x{gap_size:X} bytes) ---\n")
+                                f.write(f"      - [0x{prev_end:X}, asm]\n\n")
+                        
+                        # Block comment
+                        if self.blocks and block_idx < len(self.blocks):
+                            block = self.blocks[block_idx]
+                            f.write(f"      # --- PSYQ Block {block_idx + 1} ({len(block['objects'])} objects) ---\n")
+                    
+                    last_block_idx = block_idx
+                    
                     obj_stem = Path(r.object_name).stem
                     lib_name = r.library.replace('.LIB', '')
                     f.write(f"      - [0x{r.offset:X}, lib, {lib_name}, {obj_stem}, .text]\n")
+                    
+                    prev_end = r.offset + text_size
                 
-                # .data segments
-                has_any_data = any(
-                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".data", 0) > 0
-                    for r in valid_results
-                )
-                if has_any_data:
-                    f.write("\n      # === .data segments ===\n")
+                # Helper function to write section with block comments
+                def write_section_with_blocks(section_name: str, offsets_dict: dict):
+                    has_any = any(
+                        self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(section_name, 0) > 0
+                        for r in valid_results
+                    )
+                    if not has_any:
+                        return
+                    
+                    f.write(f"\n      # === {section_name} segments ===\n")
+                    last_blk = -1
+                    
                     for r in valid_results:
                         key = (r.library, r.object_name)
                         info = self.enrich_data.get(key, {})
-                        data_size = info.get("section_sizes", {}).get(".data", 0)
-                        if data_size > 0:
-                            obj_stem = Path(r.object_name).stem
-                            lib_name = r.library.replace('.LIB', '')
-                            
-                            # Use resolved offset if available
-                            if key in data_offsets:
-                                offset_str = f"0x{data_offsets[key]:X}"
-                            else:
-                                offset_str = "auto"
-                            
-                            f.write(f"      - [{offset_str}, lib, {lib_name}, {obj_stem}, .data]  # size: 0x{data_size:X}\n")
+                        size = info.get("section_sizes", {}).get(section_name, 0)
+                        if size <= 0:
+                            continue
+                        
+                        block_idx = result_to_block.get(r.offset, -1)
+                        
+                        # Block separator
+                        if block_idx != last_blk and block_idx >= 0:
+                            if last_blk >= 0:
+                                f.write(f"\n")  # Blank line between blocks
+                            if self.blocks and block_idx < len(self.blocks):
+                                f.write(f"      # --- Block {block_idx + 1} ---\n")
+                        last_blk = block_idx
+                        
+                        obj_stem = Path(r.object_name).stem
+                        lib_name = r.library.replace('.LIB', '')
+                        
+                        # Use resolved offset if available
+                        if key in offsets_dict:
+                            offset_str = f"0x{offsets_dict[key]:X}"
+                        else:
+                            offset_str = "auto"
+                        
+                        f.write(f"      - [{offset_str}, lib, {lib_name}, {obj_stem}, {section_name}]  # size: 0x{size:X}\n")
                 
-                # .rdata segments
-                has_any_rdata = any(
-                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".rdata", 0) > 0
-                    for r in valid_results
-                )
-                if has_any_rdata:
-                    f.write("\n      # === .rdata segments ===\n")
-                    for r in valid_results:
-                        key = (r.library, r.object_name)
-                        info = self.enrich_data.get(key, {})
-                        rdata_size = info.get("section_sizes", {}).get(".rdata", 0)
-                        if rdata_size > 0:
-                            obj_stem = Path(r.object_name).stem
-                            lib_name = r.library.replace('.LIB', '')
-                            
-                            # Use resolved offset if available
-                            if key in rdata_offsets:
-                                offset_str = f"0x{rdata_offsets[key]:X}"
-                            else:
-                                offset_str = "auto"
-                            
-                            f.write(f"      - [{offset_str}, lib, {lib_name}, {obj_stem}, .rdata]  # size: 0x{rdata_size:X}\n")
-                
-                # .sdata segments (SAME order)
-                has_any_sdata = any(
-                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".sdata", 0) > 0
-                    for r in valid_results
-                )
-                if has_any_sdata:
-                    f.write("\n      # === .sdata segments ===\n")
-                    for r in valid_results:
-                        key = (r.library, r.object_name)
-                        info = self.enrich_data.get(key, {})
-                        sdata_size = info.get("section_sizes", {}).get(".sdata", 0)
-                        if sdata_size > 0:
-                            obj_stem = Path(r.object_name).stem
-                            lib_name = r.library.replace('.LIB', '')
-                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .sdata]  # size: 0x{sdata_size:X}\n")
-                
-                # .sbss segments (SAME order)
-                has_any_sbss = any(
-                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".sbss", 0) > 0
-                    for r in valid_results
-                )
-                if has_any_sbss:
-                    f.write("\n      # === .sbss segments ===\n")
-                    for r in valid_results:
-                        key = (r.library, r.object_name)
-                        info = self.enrich_data.get(key, {})
-                        sbss_size = info.get("section_sizes", {}).get(".sbss", 0)
-                        if sbss_size > 0:
-                            obj_stem = Path(r.object_name).stem
-                            lib_name = r.library.replace('.LIB', '')
-                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .sbss]  # size: 0x{sbss_size:X}\n")
-                
-                # .bss segments (SAME order)
-                has_any_bss = any(
-                    self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".bss", 0) > 0
-                    for r in valid_results
-                )
-                if has_any_bss:
-                    f.write("\n      # === .bss segments ===\n")
-                    for r in valid_results:
-                        key = (r.library, r.object_name)
-                        info = self.enrich_data.get(key, {})
-                        bss_size = info.get("section_sizes", {}).get(".bss", 0)
-                        if bss_size > 0:
-                            obj_stem = Path(r.object_name).stem
-                            lib_name = r.library.replace('.LIB', '')
-                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .bss]  # size: 0x{bss_size:X}\n")
+                # Write .data, .rdata, .sdata, .sbss, .bss sections
+                write_section_with_blocks(".data", data_offsets)
+                write_section_with_blocks(".rdata", rdata_offsets)
+                write_section_with_blocks(".sdata", {})
+                write_section_with_blocks(".sbss", {})
+                write_section_with_blocks(".bss", {})
             
             self.status_message = f"Exported Splat YAML to {export_path}"
         except Exception as e:
