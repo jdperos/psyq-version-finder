@@ -1284,6 +1284,15 @@ class PSYQApp:
         self.enrich_data: dict[tuple[str, str], dict] = {}  # (library, object) -> readelf info
         self.enrich_errors: list[str] = []
         
+        # Block analysis (for .data/.rdata offset detection)
+        self.blocks: list[dict] = []  # List of block info dicts
+        self.block_data_offsets: dict[int, int] = {}  # block_idx -> resolved .data start
+        self.block_rdata_offsets: dict[int, int] = {}  # block_idx -> resolved .rdata start
+        self.block_search_results: list[tuple[int, float]] = []  # (offset, match%) candidates
+        self.block_searching = False
+        self.current_block_idx = -1
+        self.current_section_type = ""  # ".data" or ".rdata"
+        
         # Tab 6: Library Explorer
         self.explorer_version_idx = 0
         self.explorer_lib_idx = 0
@@ -2337,8 +2346,117 @@ class PSYQApp:
         
         imgui.separator()
         
+        # === Block Analysis Section ===
+        if self.blocks:
+            imgui.text_colored("Step 2: Resolve .data/.rdata Block Offsets", 0.4, 0.8, 1.0, 1.0)
+            imgui.text_colored(
+                f"Found {len(self.blocks)} contiguous block(s). Resolve block start offsets to enable precise .data/.rdata export.",
+                0.6, 0.6, 0.6, 1.0
+            )
+            
+            # Count resolved blocks
+            data_resolved = len(self.block_data_offsets)
+            rdata_resolved = len(self.block_rdata_offsets)
+            blocks_with_data = sum(1 for b in self.blocks if b["total_data_size"] > 0)
+            blocks_with_rdata = sum(1 for b in self.blocks if b["total_rdata_size"] > 0)
+            
+            imgui.text(f".data: {data_resolved}/{blocks_with_data} blocks resolved")
+            imgui.same_line()
+            imgui.text(f"  |  .rdata: {rdata_resolved}/{blocks_with_rdata} blocks resolved")
+            
+            imgui.separator()
+            
+            imgui.begin_child("block_analysis", 0, 300, border=True)
+            
+            for block_idx, block in enumerate(self.blocks):
+                block_id = f"block_{block_idx}"
+                
+                # Block header
+                obj_count = len(block["objects"])
+                first_obj = block["objects"][0]
+                last_obj = block["objects"][-1]
+                
+                header = f"Block {block_idx + 1}: {obj_count} objects (0x{block['text_start']:X} - 0x{block['text_end']:X})"
+                if block["gap_before"] > 0:
+                    header += f" [gap: 0x{block['gap_before']:X}]"
+                
+                expanded, _ = imgui.collapsing_header(header)
+                
+                if expanded:
+                    imgui.indent()
+                    
+                    # Show objects in this block
+                    imgui.text("Objects:")
+                    for i, r in enumerate(block["objects"][:5]):  # Show first 5
+                        imgui.text_colored(f"  {r.library} / {r.object_name}", 0.6, 0.6, 0.6, 1.0)
+                    if obj_count > 5:
+                        imgui.text_colored(f"  ... and {obj_count - 5} more", 0.5, 0.5, 0.5, 1.0)
+                    
+                    imgui.text(f"Total .data size: 0x{block['total_data_size']:X}")
+                    imgui.text(f"Total .rdata size: 0x{block['total_rdata_size']:X}")
+                    
+                    imgui.separator()
+                    
+                    # .data resolution
+                    if block["total_data_size"] > 0:
+                        data_offset = self.block_data_offsets.get(block_idx)
+                        if data_offset is not None:
+                            imgui.text_colored(f".data start: 0x{data_offset:X} ✓", 0.3, 1.0, 0.3, 1.0)
+                            imgui.same_line()
+                            if imgui.small_button(f"Clear##data_{block_id}"):
+                                del self.block_data_offsets[block_idx]
+                        else:
+                            if imgui.button(f"Search .data##data_{block_id}", width=120):
+                                self._search_block_section(block_idx, ".data")
+                            
+                            imgui.same_line()
+                            imgui.text("or enter manually:")
+                            imgui.same_line()
+                            imgui.set_next_item_width(100)
+                            # Manual entry - use a simple approach
+                            if imgui.button(f"Set...##setdata_{block_id}"):
+                                # For now, use first search result or prompt
+                                pass
+                    
+                    # .rdata resolution
+                    if block["total_rdata_size"] > 0:
+                        rdata_offset = self.block_rdata_offsets.get(block_idx)
+                        if rdata_offset is not None:
+                            imgui.text_colored(f".rdata start: 0x{rdata_offset:X} ✓", 0.3, 1.0, 0.3, 1.0)
+                            imgui.same_line()
+                            if imgui.small_button(f"Clear##rdata_{block_id}"):
+                                del self.block_rdata_offsets[block_idx]
+                        else:
+                            if imgui.button(f"Search .rdata##rdata_{block_id}", width=120):
+                                self._search_block_section(block_idx, ".rdata")
+                    
+                    # Show search results if this is the current block being searched
+                    if self.current_block_idx == block_idx and self.block_search_results:
+                        imgui.separator()
+                        imgui.text(f"Search results for {self.current_section_type}:")
+                        
+                        for offset, match_pct in self.block_search_results[:10]:
+                            if match_pct >= 95:
+                                color = (0.3, 1.0, 0.3, 1.0)
+                            elif match_pct >= 90:
+                                color = (0.8, 1.0, 0.3, 1.0)
+                            else:
+                                color = (1.0, 0.8, 0.3, 1.0)
+                            
+                            imgui.text_colored(f"  0x{offset:08X} ({match_pct:.1f}%)", *color)
+                            imgui.same_line()
+                            if imgui.small_button(f"Use##use_{offset}"):
+                                self._set_block_offset(block_idx, self.current_section_type, offset)
+                                self.block_search_results = []
+                    
+                    imgui.unindent()
+            
+            imgui.end_child()
+            
+            imgui.separator()
+        
         # === Export Section ===
-        imgui.text_colored("Step 2: Export", 0.4, 0.8, 1.0, 1.0)
+        imgui.text_colored("Step 3: Export", 0.4, 0.8, 1.0, 1.0)
         
         # Export Splat YAML
         can_export_splat = (
@@ -2346,11 +2464,17 @@ class PSYQApp:
             and non_fp_ambiguous == 0
         )
         
+        # Check if we have resolved offsets for better export
+        has_resolved_offsets = bool(self.block_data_offsets or self.block_rdata_offsets)
+        
         if can_export_splat:
             if imgui.button("Export Splat YAML", width=180):
                 self._export_splat_yaml()
             imgui.same_line()
-            imgui.text_colored("(.text with offsets, .data/.rdata/.bss with auto)", 0.5, 0.5, 0.5, 1.0)
+            if has_resolved_offsets:
+                imgui.text_colored("(.text + resolved .data/.rdata offsets)", 0.3, 1.0, 0.3, 1.0)
+            else:
+                imgui.text_colored("(.text with offsets, .data/.rdata with auto)", 0.5, 0.5, 0.5, 1.0)
         else:
             imgui.text_colored(
                 "Resolve all ambiguities to enable Splat export",
@@ -2760,6 +2884,260 @@ class PSYQApp:
                 enriched += 1
         
         self.status_message = f"Enriched {enriched} objects from {obj_root}"
+        
+        # Automatically compute blocks after enrichment
+        self._compute_blocks()
+    
+    def _compute_blocks(self):
+        """
+        Compute contiguous blocks of PSYQ objects based on .text gaps.
+        
+        A gap between consecutive .text segments indicates non-PSYQ code.
+        Objects within a block will have contiguous .data/.rdata sections too.
+        """
+        if not self.enrich_data or not self.scan_results:
+            self.blocks = []
+            return
+        
+        # Get valid results sorted by offset
+        valid_results = []
+        for r in self.scan_results:
+            if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+            ):
+                continue
+            if r.is_ambiguous:
+                continue
+            valid_results.append(r)
+        
+        valid_results.sort(key=lambda r: r.offset)
+        
+        if not valid_results:
+            self.blocks = []
+            return
+        
+        # Compute blocks by detecting gaps
+        blocks = []
+        current_block = {
+            "objects": [],  # list of scan results
+            "text_start": 0,
+            "text_end": 0,
+            "total_data_size": 0,
+            "total_rdata_size": 0,
+            "gap_before": 0,  # gap that preceded this block
+        }
+        
+        for i, r in enumerate(valid_results):
+            key = (r.library, r.object_name)
+            info = self.enrich_data.get(key, {})
+            sizes = info.get("section_sizes", {})
+            text_size = sizes.get(".text", 0)
+            data_size = sizes.get(".data", 0)
+            rdata_size = sizes.get(".rdata", 0)
+            
+            if i == 0:
+                # First object starts first block
+                current_block["objects"].append(r)
+                current_block["text_start"] = r.offset
+                current_block["text_end"] = r.offset + text_size
+                current_block["total_data_size"] = data_size
+                current_block["total_rdata_size"] = rdata_size
+            else:
+                # Check for gap
+                expected_start = current_block["text_end"]
+                actual_start = r.offset
+                gap = actual_start - expected_start
+                
+                # Allow small alignment gaps (up to 16 bytes)
+                if gap > 16:
+                    # Start a new block
+                    if current_block["objects"]:
+                        blocks.append(current_block)
+                    
+                    current_block = {
+                        "objects": [r],
+                        "text_start": r.offset,
+                        "text_end": r.offset + text_size,
+                        "total_data_size": data_size,
+                        "total_rdata_size": rdata_size,
+                        "gap_before": gap,
+                    }
+                else:
+                    # Continue current block
+                    current_block["objects"].append(r)
+                    current_block["text_end"] = r.offset + text_size
+                    current_block["total_data_size"] += data_size
+                    current_block["total_rdata_size"] += rdata_size
+        
+        # Don't forget the last block
+        if current_block["objects"]:
+            blocks.append(current_block)
+        
+        self.blocks = blocks
+        
+        # Clear any previous block offset resolutions
+        self.block_data_offsets = {}
+        self.block_rdata_offsets = {}
+        
+        self.status_message = f"Found {len(blocks)} contiguous blocks of PSYQ objects"
+    
+    def _search_block_section(self, block_idx: int, section: str, search_start: int = 0):
+        """
+        Search binary for a block's .data or .rdata section.
+        
+        Builds the expected byte pattern from the concatenated section data
+        of all objects in the block, then searches the binary.
+        """
+        if block_idx >= len(self.blocks):
+            return
+        
+        if not self.scan_binary_path or not os.path.exists(self.scan_binary_path):
+            self.status_message = "Binary file not found"
+            return
+        
+        block = self.blocks[block_idx]
+        self.current_block_idx = block_idx
+        self.current_section_type = section
+        self.block_searching = True
+        self.block_search_results = []
+        
+        # Build expected pattern from ELF section data
+        pattern_parts = []
+        for r in block["objects"]:
+            key = (r.library, r.object_name)
+            info = self.enrich_data.get(key, {})
+            
+            # Get section data from the .o file
+            obj_path = info.get("obj_path", "")
+            if not obj_path or not os.path.exists(obj_path):
+                continue
+            
+            section_info = info.get("sections", {}).get(section, {})
+            section_offset = section_info.get("offset", 0)
+            section_size = section_info.get("size", 0)
+            
+            if section_size > 0:
+                try:
+                    with open(obj_path, "rb") as f:
+                        f.seek(section_offset)
+                        data = f.read(section_size)
+                        pattern_parts.append((r, data))
+                except Exception:
+                    pass
+        
+        if not pattern_parts:
+            self.status_message = f"No {section} data found in block {block_idx + 1}"
+            self.block_searching = False
+            return
+        
+        # Read binary
+        try:
+            with open(self.scan_binary_path, "rb") as f:
+                binary = f.read()
+        except Exception as e:
+            self.status_message = f"Failed to read binary: {e}"
+            self.block_searching = False
+            return
+        
+        # Search for the first object's section data as anchor
+        first_obj, first_data = pattern_parts[0]
+        
+        # Use first N bytes as search anchor (enough to be unique but not too much)
+        anchor_len = min(32, len(first_data))
+        anchor = first_data[:anchor_len]
+        
+        candidates = []
+        pos = search_start
+        binary_len = len(binary)
+        
+        while pos < binary_len - len(anchor):
+            found_pos = binary.find(anchor, pos)
+            if found_pos == -1:
+                break
+            
+            # Check alignment (4-byte)
+            if found_pos % 4 != 0:
+                pos = found_pos + 1
+                continue
+            
+            # Verify more of the pattern
+            match_score = 0
+            total_bytes = 0
+            check_offset = found_pos
+            
+            for obj, data in pattern_parts:
+                data_len = len(data)
+                if check_offset + data_len > binary_len:
+                    break
+                
+                # Count matching bytes
+                for i, b in enumerate(data):
+                    total_bytes += 1
+                    if binary[check_offset + i] == b:
+                        match_score += 1
+                
+                check_offset += data_len
+            
+            if total_bytes > 0:
+                match_pct = (match_score / total_bytes) * 100
+                if match_pct >= 80:  # Reasonable threshold
+                    candidates.append((found_pos, match_pct))
+            
+            pos = found_pos + 1
+            
+            # Limit candidates
+            if len(candidates) >= 20:
+                break
+        
+        # Sort by match percentage descending
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        self.block_search_results = candidates
+        self.block_searching = False
+        
+        if candidates:
+            self.status_message = f"Found {len(candidates)} candidate(s) for block {block_idx + 1} {section}"
+        else:
+            self.status_message = f"No matches found for block {block_idx + 1} {section}"
+    
+    def _set_block_offset(self, block_idx: int, section: str, offset: int):
+        """Set the resolved offset for a block's section."""
+        if section == ".data":
+            self.block_data_offsets[block_idx] = offset
+        elif section == ".rdata":
+            self.block_rdata_offsets[block_idx] = offset
+        
+        self.status_message = f"Set block {block_idx + 1} {section} start to 0x{offset:X}"
+    
+    def _compute_section_offsets(self, section: str) -> dict[tuple[str, str], int]:
+        """
+        Compute per-object offsets for a section based on resolved block starts.
+        
+        Returns dict of (library, object_name) -> offset
+        """
+        offsets = {}
+        
+        block_starts = self.block_data_offsets if section == ".data" else self.block_rdata_offsets
+        
+        for block_idx, block in enumerate(self.blocks):
+            if block_idx not in block_starts:
+                continue  # Block not resolved yet
+            
+            current_offset = block_starts[block_idx]
+            
+            for r in block["objects"]:
+                key = (r.library, r.object_name)
+                info = self.enrich_data.get(key, {})
+                section_size = info.get("section_sizes", {}).get(section, 0)
+                
+                if section_size > 0:
+                    offsets[key] = current_offset
+                    current_offset += section_size
+                    # Align to 4 bytes
+                    if current_offset % 4 != 0:
+                        current_offset += 4 - (current_offset % 4)
+        
+        return offsets
     
     def _export_splat_yaml(self):
         """Export scan results as Splat YAML subsegments."""
@@ -2793,12 +3171,22 @@ class PSYQApp:
         if self.scan_version_idx > 0 and self.versions:
             version_filter = self.versions[self.scan_version_idx - 1]
         
+        # Compute resolved offsets if we have block resolutions
+        data_offsets = self._compute_section_offsets(".data")
+        rdata_offsets = self._compute_section_offsets(".rdata")
+        
+        has_resolved_data = bool(data_offsets)
+        has_resolved_rdata = bool(rdata_offsets)
+        
         try:
             with open(export_path, "w") as f:
                 f.write(f"# PSY-Q Splat Subsegments\n")
                 f.write(f"# Binary: {self.scan_binary_path}\n")
                 f.write(f"# SDK Version: {version_filter or 'mixed'}\n")
                 f.write(f"# Objects: {len(valid_results)}\n")
+                if has_resolved_data or has_resolved_rdata:
+                    f.write(f"# .data offsets: {'resolved' if has_resolved_data else 'auto'}\n")
+                    f.write(f"# .rdata offsets: {'resolved' if has_resolved_rdata else 'auto'}\n")
                 f.write(f"#\n")
                 f.write(f"# Format: [offset, type, library, object, section]\n")
                 f.write(f"# Note: Order matches binary layout (sorted by .text offset)\n")
@@ -2811,7 +3199,7 @@ class PSYQApp:
                     lib_name = r.library.replace('.LIB', '')
                     f.write(f"      - [0x{r.offset:X}, lib, {lib_name}, {obj_stem}, .text]\n")
                 
-                # .data segments (auto offsets, SAME order as .text)
+                # .data segments
                 has_any_data = any(
                     self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".data", 0) > 0
                     for r in valid_results
@@ -2825,9 +3213,16 @@ class PSYQApp:
                         if data_size > 0:
                             obj_stem = Path(r.object_name).stem
                             lib_name = r.library.replace('.LIB', '')
-                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .data]  # size: 0x{data_size:X}\n")
+                            
+                            # Use resolved offset if available
+                            if key in data_offsets:
+                                offset_str = f"0x{data_offsets[key]:X}"
+                            else:
+                                offset_str = "auto"
+                            
+                            f.write(f"      - [{offset_str}, lib, {lib_name}, {obj_stem}, .data]  # size: 0x{data_size:X}\n")
                 
-                # .rdata segments (SAME order)
+                # .rdata segments
                 has_any_rdata = any(
                     self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(".rdata", 0) > 0
                     for r in valid_results
@@ -2841,7 +3236,14 @@ class PSYQApp:
                         if rdata_size > 0:
                             obj_stem = Path(r.object_name).stem
                             lib_name = r.library.replace('.LIB', '')
-                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, .rdata]  # size: 0x{rdata_size:X}\n")
+                            
+                            # Use resolved offset if available
+                            if key in rdata_offsets:
+                                offset_str = f"0x{rdata_offsets[key]:X}"
+                            else:
+                                offset_str = "auto"
+                            
+                            f.write(f"      - [{offset_str}, lib, {lib_name}, {obj_stem}, .rdata]  # size: 0x{rdata_size:X}\n")
                 
                 # .sdata segments (SAME order)
                 has_any_sdata = any(
