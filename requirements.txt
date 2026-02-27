@@ -6,3 +6,4 @@ glfw>=2.0.0
 PyOpenGL>=3.1.0
 requests>=2.25.0
 pyelftools>=0.29
+pyyaml>=6.0

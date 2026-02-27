@@ -191,6 +191,10 @@ class SDKManager:
                     # Extract library name (e.g., "LIBSPU.LIB.json" -> "LIBSPU.LIB")
                     lib_name = item["name"][:-5]  # Remove .json
                     libraries.append(lib_name)
+                elif item["type"] == "file" and item["name"].endswith(".OBJ.json"):
+                    # Loose OBJ files (e.g., "2MBYTE.OBJ.json" -> "2MBYTE.OBJ")
+                    obj_name = item["name"][:-5]  # Remove .json
+                    libraries.append(obj_name)  # Treat as a pseudo-library
             
             libraries.sort()
             self._libraries_cache[version] = libraries
@@ -262,8 +266,12 @@ class SDKManager:
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            # Maybe it's wrapped in a key?
-            if "objects" in data:
+            # Check if this is a single object entry (loose OBJ file)
+            # Single objects typically have "name" and "sig" at the top level
+            if "name" in data and "sig" in data:
+                # Single object - wrap in list
+                items = [data]
+            elif "objects" in data:
                 items = data["objects"]
             elif "entries" in data:
                 items = data["entries"]
@@ -1001,9 +1009,14 @@ class ScanEngine:
         
         return best_offset, best_length
     
-    def preprocess(self, library_filter: Optional[str] = None, version_filter: Optional[str] = None) -> None:
+    def preprocess(
+        self, 
+        library_filter: Optional[str] = None, 
+        version_filter: Optional[str] = None,
+        lib_version_overrides: Optional[dict[str, str]] = None
+    ) -> None:
         """
-        Preprocess all signatures from all SDK versions.
+        Preprocess all signatures from SDK versions.
         
         Deduplicates identical signatures across versions so we only scan once
         per unique byte pattern.
@@ -1011,15 +1024,19 @@ class ScanEngine:
         Args:
             library_filter: If set, only preprocess this library (faster).
             version_filter: If set, only preprocess this SDK version (faster).
+            lib_version_overrides: Dict mapping library names to override versions.
+                                   Libraries with overrides use ONLY that version.
         """
         self._signatures = []
         self._preprocessed = False
         
-        versions = self.sdk_manager.discover_versions()
+        if lib_version_overrides is None:
+            lib_version_overrides = {}
         
-        # Apply version filter
-        if version_filter:
-            versions = [v for v in versions if v == version_filter]
+        all_versions = self.sdk_manager.discover_versions()
+        
+        # Determine which versions to process for non-overridden libraries
+        base_versions = [version_filter] if version_filter else all_versions
         
         # Key: (library, object_name, data_bytes, mask_bytes) -> ScanSignature
         # This deduplicates identical signatures across versions
@@ -1028,11 +1045,16 @@ class ScanEngine:
         # Also store labels per (library, object_name, version) for the results
         labels_map: dict[tuple[str, str, str], list[Label]] = {}
         
-        total_steps = len(versions)
+        # Track what we've processed
+        processed_pairs: set[tuple[str, str]] = set()
         
-        for step, version in enumerate(versions):
+        # First pass: process base versions for non-overridden libraries
+        for version in base_versions:
+            if version not in all_versions:
+                continue
+                
             self._progress_message = f"Loading SDK {version}..."
-            self._progress_pct = step / total_steps
+            self._progress_pct = base_versions.index(version) / max(len(base_versions), 1)
             
             if library_filter:
                 lib_names = [library_filter]
@@ -1040,6 +1062,15 @@ class ScanEngine:
                 lib_names = self.sdk_manager.discover_libraries(version)
             
             for lib_name in lib_names:
+                # Skip if this library has an override (we'll handle it separately)
+                if lib_name in lib_version_overrides:
+                    continue
+                
+                pair_key = (lib_name, version)
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
+                
                 lib = self.sdk_manager.fetch_library(version, lib_name)
                 if not lib:
                     continue
@@ -1050,20 +1081,17 @@ class ScanEngine:
                     
                     data, mask = signature_to_bytes(obj.sig)
                     if len(data) < self.MIN_ANCHOR_LENGTH:
-                        continue  # Too short to scan reliably
+                        continue
                     
                     key = (lib_name, obj.name, data, mask)
                     labels_map[(lib_name, obj.name, version)] = obj.labels
                     
                     if key in sig_map:
-                        # Same signature already seen — just add this version
                         sig_map[key].versions.append(version)
                     else:
-                        # New unique signature
                         anchor_off, anchor_len = self._find_best_anchor(mask)
-                        
                         if anchor_len < self.MIN_ANCHOR_LENGTH:
-                            continue  # Not enough concrete bytes for a reliable anchor
+                            continue
                         
                         anchor_bytes = data[anchor_off:anchor_off + anchor_len]
                         concrete_count = sum(1 for m in mask if m == 0xFF)
@@ -1079,6 +1107,57 @@ class ScanEngine:
                             anchor_bytes=anchor_bytes,
                             concrete_count=concrete_count,
                         )
+        
+        # Second pass: process overridden libraries from their override versions
+        for lib_name, override_ver in lib_version_overrides.items():
+            if library_filter and lib_name != library_filter:
+                continue
+            if override_ver not in all_versions:
+                continue
+            
+            pair_key = (lib_name, override_ver)
+            if pair_key in processed_pairs:
+                continue
+            processed_pairs.add(pair_key)
+            
+            self._progress_message = f"Loading {lib_name} from SDK {override_ver} (override)..."
+            
+            lib = self.sdk_manager.fetch_library(override_ver, lib_name)
+            if not lib:
+                continue
+            
+            for obj in lib.objects:
+                if not obj.sig:
+                    continue
+                
+                data, mask = signature_to_bytes(obj.sig)
+                if len(data) < self.MIN_ANCHOR_LENGTH:
+                    continue
+                
+                key = (lib_name, obj.name, data, mask)
+                labels_map[(lib_name, obj.name, override_ver)] = obj.labels
+                
+                if key in sig_map:
+                    sig_map[key].versions.append(override_ver)
+                else:
+                    anchor_off, anchor_len = self._find_best_anchor(mask)
+                    if anchor_len < self.MIN_ANCHOR_LENGTH:
+                        continue
+                    
+                    anchor_bytes = data[anchor_off:anchor_off + anchor_len]
+                    concrete_count = sum(1 for m in mask if m == 0xFF)
+                    
+                    sig_map[key] = ScanSignature(
+                        library=lib_name,
+                        object_name=obj.name,
+                        versions=[override_ver],
+                        data=data,
+                        mask=mask,
+                        sig_length=len(data),
+                        anchor_offset=anchor_off,
+                        anchor_bytes=anchor_bytes,
+                        concrete_count=concrete_count,
+                    )
         
         self._signatures = list(sig_map.values())
         # Sort versions within each signature
@@ -1098,9 +1177,10 @@ class ScanEngine:
         total_across_versions = sum(len(s.versions) for s in self._signatures)
         num_groups = len(set(s.subsumption_group for s in self._signatures if s.subsumption_group >= 0))
         subsumption_msg = f", {num_groups} subsumption groups" if num_groups else ""
+        override_msg = f", {len(lib_version_overrides)} override(s)" if lib_version_overrides else ""
         self._progress_message = (
             f"Preprocessed {len(self._signatures)} unique signatures "
-            f"({total_across_versions} total across versions{subsumption_msg})"
+            f"({total_across_versions} total across versions{subsumption_msg}{override_msg})"
         )
     
     def _detect_subsumptions(self) -> None:
@@ -1436,14 +1516,41 @@ class PSYQApp:
         self.enrich_data: dict[tuple[str, str], dict] = {}  # (library, object) -> readelf info
         self.enrich_errors: list[str] = []
         
-        # Block analysis (for .data/.rdata offset detection)
-        self.blocks: list[dict] = []  # List of block info dicts
-        self.block_data_offsets: dict[int, int] = {}  # block_idx -> resolved .data start
-        self.block_rdata_offsets: dict[int, int] = {}  # block_idx -> resolved .rdata start
-        self.block_search_results: list[tuple[int, float]] = []  # (offset, match%) candidates
+        # Per-library version overrides for enrichment
+        # Key is library name (or "" for loose objs), value is version string
+        self.lib_version_overrides: dict[str, str] = {}
+        
+        # Section ordering and offset resolution
+        # Each entry: {"library": str, "object": str, "offset": int or None, "size": int}
+        self.data_section_list: list[dict] = []
+        self.rdata_section_list: list[dict] = []
+        
+        # Section search state
+        self.section_search_results: list[tuple[int, float]] = []  # (offset, match%) candidates
+        self.section_search_key: tuple[str, str, str] = ("", "", "")  # (library, object, section)
+        self.section_searching = False
+        
+        # Section diff display state
+        self.section_diff_key: tuple[str, str, str, int] = ("", "", "", 0)  # (library, object, section, offset)
+        self.section_diff_data: Optional[dict] = None  # Diff data for inline display
+        
+        # Section verification cache to avoid repeated file I/O
+        # Key: (library, object, section, offset) -> (match_pct, matched, total)
+        self.section_verify_cache: dict[tuple[str, str, str, int], tuple[float, int, int]] = {}
+        
+        # Legacy block state (kept for compatibility during transition)
+        self.blocks: list[dict] = []
+        self.block_data_offsets: dict[int, int] = {}
+        self.block_rdata_offsets: dict[int, int] = {}
+        self.block_search_results: list[tuple[int, float]] = []
         self.block_searching = False
         self.current_block_idx = -1
-        self.current_section_type = ""  # ".data" or ".rdata"
+        self.current_section_type = ""
+        
+        # Tab 7: Verify Splat (new)
+        self.verify_splat_path = ""
+        self.verify_results: list[dict] = []  # verification results
+        self.verify_running = False
         
         # Tab 6: Library Explorer
         self.explorer_version_idx = 0
@@ -2122,6 +2229,82 @@ class PSYQApp:
             self.scan_engine._preprocessed = False
             self.scan_results = []
         
+        # Library version overrides (collapsible)
+        if self.versions:
+            expanded, _ = imgui.collapsing_header("Library Version Overrides")
+            if expanded:
+                imgui.text_colored(
+                    "Override SDK version for specific libraries (e.g., LIBCARD uses 460 while others use 450)",
+                    0.6, 0.6, 0.6, 1.0
+                )
+                
+                # Always use the full library list from SDK (not filtered by scan results)
+                # This ensures users can set overrides for libraries not yet found
+                libraries_available = set()
+                if self.all_libraries:
+                    for lib in self.all_libraries:
+                        if lib != "(All Libraries)":
+                            libraries_available.add(lib)
+                
+                if libraries_available:
+                    # Separate into .LIB and loose .OBJ files
+                    lib_files = sorted([l for l in libraries_available if l.upper().endswith(".LIB")])
+                    obj_files = sorted([l for l in libraries_available if l.upper().endswith(".OBJ")])
+                    sorted_libs = lib_files + obj_files
+                    
+                    # Show in scrollable area
+                    height = min(180, 25 * len(sorted_libs))
+                    imgui.begin_child("version_overrides_scan", 0, height, border=True)
+                    
+                    for lib in sorted_libs:
+                        current_override = self.lib_version_overrides.get(lib, "")
+                        
+                        # Display name: mark loose OBJ files
+                        if lib.upper().endswith(".OBJ"):
+                            display_lib = f"{lib} (loose)"
+                        else:
+                            display_lib = lib
+                        
+                        imgui.text(f"{display_lib}:")
+                        imgui.same_line()
+                        imgui.set_next_item_width(80)
+                        
+                        # Version dropdown
+                        versions_with_default = ["(default)"] + self.versions
+                        current_idx = 0
+                        if current_override and current_override in self.versions:
+                            current_idx = self.versions.index(current_override) + 1
+                        
+                        changed, new_idx = imgui.combo(
+                            f"##scanver_{lib}", current_idx, versions_with_default
+                        )
+                        if changed:
+                            if new_idx == 0:
+                                if lib in self.lib_version_overrides:
+                                    del self.lib_version_overrides[lib]
+                            else:
+                                self.lib_version_overrides[lib] = self.versions[new_idx - 1]
+                            # Invalidate preprocessing when overrides change
+                            self.scan_preprocessed = False
+                            self.scan_engine._preprocessed = False
+                            self.scan_results = []
+                    
+                    imgui.end_child()
+                    
+                    if self.lib_version_overrides:
+                        if self.scan_preprocessed:
+                            # Already preprocessed with these overrides
+                            imgui.text_colored(
+                                f"{len(self.lib_version_overrides)} override(s) applied",
+                                0.3, 1.0, 0.3, 1.0
+                            )
+                        else:
+                            # Need to preprocess to apply
+                            imgui.text_colored(
+                                f"{len(self.lib_version_overrides)} override(s) - will apply on preprocess",
+                                0.8, 0.8, 0.3, 1.0
+                            )
+        
         # Alignment option
         _, self.scan_align_to_4 = imgui.checkbox("Require 4-byte alignment (MIPS)", self.scan_align_to_4)
         imgui.same_line()
@@ -2443,6 +2626,304 @@ class PSYQApp:
             
             imgui.end_child()
     
+    def _render_section_list(self, section: str, section_list: list[dict]):
+        """Render the section ordering and offset resolution UI."""
+        if not section_list:
+            imgui.text_colored(f"No objects with {section} sections found", 0.6, 0.6, 0.6, 1.0)
+            return
+        
+        # Count resolved
+        resolved_count = sum(1 for e in section_list if e["offset"] is not None)
+        imgui.text(f"{resolved_count}/{len(section_list)} offsets resolved")
+        
+        # Chain all button
+        if resolved_count > 0 and resolved_count < len(section_list):
+            imgui.same_line()
+            if imgui.button(f"Chain All##{section}"):
+                for i in range(len(section_list)):
+                    if section_list[i]["offset"] is None and i > 0:
+                        self._chain_section_offset(section_list, i)
+        
+        # Clear all button
+        if resolved_count > 0:
+            imgui.same_line()
+            if imgui.button(f"Clear All##{section}"):
+                for e in section_list:
+                    e["offset"] = None
+        
+        imgui.begin_child(f"section_list_{section}", 0, 350, border=True)
+        
+        # Header
+        imgui.columns(7, f"sec_cols_{section}")
+        imgui.set_column_width(0, 50)   # Move
+        imgui.set_column_width(1, 100)  # Library
+        imgui.set_column_width(2, 100)  # Object
+        imgui.set_column_width(3, 60)   # Size
+        imgui.set_column_width(4, 90)   # Offset
+        imgui.set_column_width(5, 60)   # Match%
+        imgui.text("Move")
+        imgui.next_column()
+        imgui.text("Library")
+        imgui.next_column()
+        imgui.text("Object")
+        imgui.next_column()
+        imgui.text("Size")
+        imgui.next_column()
+        imgui.text("Offset")
+        imgui.next_column()
+        imgui.text("Match")
+        imgui.next_column()
+        imgui.text("Actions")
+        imgui.columns(1)
+        imgui.separator()
+        
+        for idx, entry in enumerate(section_list):
+            row_id = f"{section}_{idx}_{entry['library']}_{entry['object']}"
+            
+            imgui.columns(7, row_id)
+            imgui.set_column_width(0, 50)
+            imgui.set_column_width(1, 100)
+            imgui.set_column_width(2, 100)
+            imgui.set_column_width(3, 60)
+            imgui.set_column_width(4, 90)
+            imgui.set_column_width(5, 60)
+            
+            # Move buttons - use ^ and v to conserve space
+            if idx > 0:
+                if imgui.small_button(f"^##{row_id}"):
+                    self._move_section_entry(section_list, idx, -1)
+            if idx < len(section_list) - 1:
+                if idx > 0:
+                    imgui.same_line()
+                if imgui.small_button(f"v##{row_id}"):
+                    self._move_section_entry(section_list, idx, 1)
+            imgui.next_column()
+            
+            # Library
+            lib_display = entry["library"] if entry["library"] else "(loose)"
+            imgui.text(lib_display)
+            imgui.next_column()
+            
+            # Object
+            imgui.text(entry["object"])
+            imgui.next_column()
+            
+            # Size
+            imgui.text(f"0x{entry['size']:X}")
+            imgui.next_column()
+            
+            # Offset
+            if entry["offset"] is not None:
+                imgui.text_colored(f"0x{entry['offset']:X}", 0.3, 1.0, 0.3, 1.0)
+            else:
+                imgui.text_colored("auto", 0.5, 0.5, 0.5, 1.0)
+            imgui.next_column()
+            
+            # Match percentage (verify if offset is set)
+            match_pct = 0.0
+            if entry["offset"] is not None:
+                match_pct, _, _ = self._verify_section_at_offset(
+                    entry["library"], entry["object"], section, entry["offset"]
+                )
+                if match_pct >= 99.9:
+                    imgui.text_colored(f"{match_pct:.1f}%", 0.3, 1.0, 0.3, 1.0)
+                elif match_pct >= 90:
+                    imgui.text_colored(f"{match_pct:.1f}%", 0.8, 1.0, 0.3, 1.0)
+                else:
+                    imgui.text_colored(f"{match_pct:.1f}%", 1.0, 0.5, 0.3, 1.0)
+            else:
+                imgui.text("-")
+            imgui.next_column()
+            
+            # Actions
+            if imgui.small_button(f"Search##{row_id}"):
+                self._search_single_section(entry["library"], entry["object"], section)
+            imgui.same_line()
+            
+            if idx > 0 and section_list[idx - 1]["offset"] is not None:
+                if imgui.small_button(f"Chain##{row_id}"):
+                    self._chain_section_offset(section_list, idx)
+                imgui.same_line()
+            
+            if imgui.small_button(f"Set##{row_id}"):
+                # Toggle manual input mode
+                if not hasattr(self, '_manual_input_key') or self._manual_input_key != row_id:
+                    self._manual_input_key = row_id
+                    self._manual_input_str = f"0x{entry['offset']:X}" if entry["offset"] else "0x"
+                else:
+                    self._manual_input_key = None
+            
+            if entry["offset"] is not None:
+                imgui.same_line()
+                if imgui.small_button(f"X##{row_id}"):
+                    entry["offset"] = None
+                
+                # Show diff button for non-perfect matches
+                if match_pct < 99.9:
+                    imgui.same_line()
+                    if imgui.small_button(f"Diff##{row_id}"):
+                        self._compute_section_diff(entry["library"], entry["object"], section, entry["offset"])
+            
+            imgui.columns(1)
+            
+            # Manual input row
+            if hasattr(self, '_manual_input_key') and self._manual_input_key == row_id:
+                imgui.indent()
+                imgui.text("Offset:")
+                imgui.same_line()
+                imgui.set_next_item_width(100)
+                _, self._manual_input_str = imgui.input_text(f"##manual_{row_id}", self._manual_input_str, 32)
+                imgui.same_line()
+                if imgui.small_button(f"Apply##{row_id}"):
+                    try:
+                        # Parse hex or decimal
+                        val_str = self._manual_input_str.strip()
+                        if val_str.startswith("0x") or val_str.startswith("0X"):
+                            entry["offset"] = int(val_str, 16)
+                        else:
+                            entry["offset"] = int(val_str)
+                        self._manual_input_key = None
+                        self.status_message = f"Set offset to 0x{entry['offset']:X}"
+                    except ValueError:
+                        self.status_message = "Invalid offset format (use 0x1234 or decimal)"
+                imgui.same_line()
+                if imgui.small_button(f"Cancel##{row_id}"):
+                    self._manual_input_key = None
+                imgui.unindent()
+            
+            # Show search results if this is the current search
+            if self.section_search_key == (entry["library"], entry["object"], section) and self.section_search_results:
+                imgui.indent()
+                imgui.text_colored("Search results:", 0.6, 0.6, 0.6, 1.0)
+                for offset, match_pct in self.section_search_results[:5]:
+                    if match_pct >= 99.9:
+                        color = (0.3, 1.0, 0.3, 1.0)
+                    elif match_pct >= 90:
+                        color = (0.8, 1.0, 0.3, 1.0)
+                    else:
+                        color = (1.0, 0.8, 0.3, 1.0)
+                    
+                    imgui.text_colored(f"  0x{offset:08X} ({match_pct:.1f}%)", *color)
+                    imgui.same_line()
+                    if imgui.small_button(f"Use##use_{offset}_{row_id}"):
+                        entry["offset"] = offset
+                        self.section_search_results = []
+                        self.section_search_key = ("", "", "")
+                imgui.unindent()
+            
+            # Show inline diff if this is the current diff
+            if (self.section_diff_data and 
+                self.section_diff_key == (entry["library"], entry["object"], section, entry["offset"])):
+                self._render_inline_diff()
+            
+            imgui.separator()
+        
+        imgui.end_child()
+    
+    def _render_inline_diff(self):
+        """Render inline diff display for section comparison."""
+        diff = self.section_diff_data
+        if not diff:
+            return
+        
+        imgui.indent()
+        
+        # Header with close button
+        imgui.text_colored(f"Diff: {diff['library']}/{diff['object']} {diff['section']}", 0.4, 0.8, 1.0, 1.0)
+        imgui.same_line()
+        if imgui.small_button("Close##diff"):
+            self.section_diff_data = None
+            self.section_diff_key = ("", "", "", 0)
+            imgui.unindent()
+            return
+        
+        # Summary
+        imgui.text(f"Version: {diff['version_used']}  |  Size: 0x{diff['section_size']:X}")
+        imgui.text(f"Match: {diff['match_count']}  Mismatch: {diff['mismatch_count']}  Wildcard: {diff['wildcard_count']}")
+        
+        if diff['mismatch_count'] > 0:
+            imgui.text_colored(f"Match: {diff['match_pct']:.1f}%", 1.0, 0.5, 0.3, 1.0)
+        else:
+            imgui.text_colored(f"Match: {diff['match_pct']:.1f}%", 0.3, 1.0, 0.3, 1.0)
+        
+        # Mismatch list
+        if diff['mismatches']:
+            imgui.text_colored(f"Mismatches ({diff['total_mismatches']} total):", 1.0, 0.7, 0.3, 1.0)
+            for mm in diff['mismatches'][:10]:
+                imgui.text(f"  @0x{mm['offset']:04X} (bin 0x{mm['binary_offset']:08X}): "
+                          f"obj=0x{mm['obj_byte']:02X} bin=0x{mm['bin_byte']:02X}")
+            if diff['total_mismatches'] > 10:
+                imgui.text_colored(f"  ... and {diff['total_mismatches'] - 10} more", 0.5, 0.5, 0.5, 1.0)
+        
+        # Hex comparison (first 128 bytes or around first mismatch)
+        imgui.text_colored("Hex comparison:", 0.6, 0.6, 0.6, 1.0)
+        
+        obj_data = diff['obj_data']
+        bin_data = diff['bin_data']
+        mask = diff['mask']
+        section_size = min(diff['section_size'], 128)  # Limit display
+        
+        # Find first mismatch to center view
+        start_offset = 0
+        if diff['mismatches']:
+            first_mm = diff['mismatches'][0]['offset']
+            start_offset = max(0, (first_mm // 16) * 16 - 16)  # Start one row before
+            if start_offset + 128 > diff['section_size']:
+                start_offset = max(0, diff['section_size'] - 128)
+        
+        for row_start in range(start_offset, min(start_offset + 128, diff['section_size']), 16):
+            # Build row display
+            imgui.text(f"0x{row_start:04X} ")
+            imgui.same_line()
+            
+            for i in range(16):
+                idx = row_start + i
+                if idx >= diff['section_size']:
+                    break
+                
+                obj_b = obj_data[idx] if idx < len(obj_data) else 0
+                bin_b = bin_data[idx] if idx < len(bin_data) else 0
+                is_wildcard = mask[idx] == 0x00
+                
+                if is_wildcard:
+                    # Wildcard - gray
+                    imgui.text_colored(f"{obj_b:02X}", 0.4, 0.4, 0.4, 1.0)
+                elif obj_b != bin_b:
+                    # Mismatch - red for obj, green for bin
+                    imgui.text_colored(f"{obj_b:02X}", 1.0, 0.3, 0.3, 1.0)
+                else:
+                    # Match - white
+                    imgui.text(f"{obj_b:02X}")
+                
+                imgui.same_line()
+            
+            imgui.text(" | ")
+            imgui.same_line()
+            
+            for i in range(16):
+                idx = row_start + i
+                if idx >= diff['section_size']:
+                    break
+                
+                obj_b = obj_data[idx] if idx < len(obj_data) else 0
+                bin_b = bin_data[idx] if idx < len(bin_data) else 0
+                is_wildcard = mask[idx] == 0x00
+                
+                if is_wildcard:
+                    imgui.text_colored(f"{bin_b:02X}", 0.4, 0.4, 0.4, 1.0)
+                elif obj_b != bin_b:
+                    imgui.text_colored(f"{bin_b:02X}", 0.3, 1.0, 0.3, 1.0)
+                else:
+                    imgui.text(f"{bin_b:02X}")
+                
+                imgui.same_line()
+            
+            imgui.text("")  # End the line
+        
+        imgui.text_colored("(obj bytes | bin bytes, red=obj mismatch, green=bin mismatch, gray=wildcard)", 0.5, 0.5, 0.5, 1.0)
+        
+        imgui.unindent()
+    
     def render_enrich_tab(self):
         """Render the enrichment and export tab."""
         imgui.text("Enrich scan results with ELF section data and export for Splat")
@@ -2571,7 +3052,29 @@ class PSYQApp:
         
         imgui.separator()
         
-        # === Block Analysis Section ===
+        # === Section Ordering (new approach) ===
+        if self.data_section_list or self.rdata_section_list:
+            imgui.text_colored("Step 2: Data Section Offsets", 0.4, 0.8, 1.0, 1.0)
+            imgui.text_colored(
+                "Resolve offsets for .data/.rdata sections. Reorder if needed, then search or chain offsets.",
+                0.6, 0.6, 0.6, 1.0
+            )
+            
+            # Tabs for .data and .rdata
+            if imgui.begin_tab_bar("section_tabs"):
+                if imgui.begin_tab_item(".data")[0]:
+                    self._render_section_list(".data", self.data_section_list)
+                    imgui.end_tab_item()
+                
+                if imgui.begin_tab_item(".rdata")[0]:
+                    self._render_section_list(".rdata", self.rdata_section_list)
+                    imgui.end_tab_item()
+                
+                imgui.end_tab_bar()
+            
+            imgui.separator()
+        
+        # === Legacy Block Analysis Section (for transition) ===
         if self.blocks:
             imgui.text_colored("Step 2: Resolve .data/.rdata Block Offsets", 0.4, 0.8, 1.0, 1.0)
             imgui.text_colored(
@@ -2661,8 +3164,10 @@ class PSYQApp:
                         imgui.text(f"Search results for {self.current_section_type}:")
                         
                         for offset, match_pct in self.block_search_results[:10]:
-                            if match_pct >= 95:
+                            if match_pct >= 99.9:
                                 color = (0.3, 1.0, 0.3, 1.0)
+                            elif match_pct >= 95:
+                                color = (0.6, 1.0, 0.3, 1.0)
                             elif match_pct >= 90:
                                 color = (0.8, 1.0, 0.3, 1.0)
                             else:
@@ -2673,6 +3178,9 @@ class PSYQApp:
                             if imgui.small_button(f"Use##use_{offset}"):
                                 self._set_block_offset(block_idx, self.current_section_type, offset)
                                 self.block_search_results = []
+                            imgui.same_line()
+                            if imgui.small_button(f"Debug##dbg_{offset}"):
+                                self._dump_block_section_debug(block_idx, self.current_section_type, offset)
                     
                     imgui.unindent()
             
@@ -2690,14 +3198,19 @@ class PSYQApp:
         )
         
         # Check if we have resolved offsets for better export
-        has_resolved_offsets = bool(self.block_data_offsets or self.block_rdata_offsets)
+        data_resolved = sum(1 for e in self.data_section_list if e["offset"] is not None)
+        rdata_resolved = sum(1 for e in self.rdata_section_list if e["offset"] is not None)
+        has_resolved_offsets = data_resolved > 0 or rdata_resolved > 0
         
         if can_export_splat:
             if imgui.button("Export Splat YAML", width=180):
                 self._export_splat_yaml()
             imgui.same_line()
             if has_resolved_offsets:
-                imgui.text_colored("(.text + resolved .data/.rdata offsets)", 0.3, 1.0, 0.3, 1.0)
+                imgui.text_colored(
+                    f"(.text + {data_resolved} .data + {rdata_resolved} .rdata resolved)", 
+                    0.3, 1.0, 0.3, 1.0
+                )
             else:
                 imgui.text_colored("(.text with offsets, .data/.rdata with auto)", 0.5, 0.5, 0.5, 1.0)
         else:
@@ -2714,65 +3227,65 @@ class PSYQApp:
         
         imgui.separator()
         
-        # === Enrichment Preview ===
+        # === Enrichment Preview (collapsible) ===
         if self.enrich_data:
-            imgui.text_colored("Enrichment Preview:", 0.4, 0.8, 1.0, 1.0)
-            
-            imgui.begin_child("enrich_preview", 0, 250, border=True)
-            
-            # Header
-            imgui.columns(6, "enrich_cols")
-            imgui.set_column_width(0, 120)  # Library
-            imgui.set_column_width(1, 120)  # Object
-            imgui.set_column_width(2, 70)   # .text
-            imgui.set_column_width(3, 70)   # .data
-            imgui.set_column_width(4, 70)   # .rdata
-            imgui.set_column_width(5, 70)   # .bss
-            imgui.text("Library")
-            imgui.next_column()
-            imgui.text("Object")
-            imgui.next_column()
-            imgui.text(".text")
-            imgui.next_column()
-            imgui.text(".data")
-            imgui.next_column()
-            imgui.text(".rdata")
-            imgui.next_column()
-            imgui.text(".bss")
-            imgui.columns(1)
-            imgui.separator()
-            
-            # Data rows
-            for (lib, obj), info in sorted(self.enrich_data.items()):
-                sizes = info.get("section_sizes", {})
-                imgui.columns(6, f"enrich_{lib}_{obj}")
-                imgui.set_column_width(0, 120)
-                imgui.set_column_width(1, 120)
-                imgui.set_column_width(2, 70)
-                imgui.set_column_width(3, 70)
-                imgui.set_column_width(4, 70)
-                imgui.set_column_width(5, 70)
+            expanded, _ = imgui.collapsing_header("Enrichment Preview")
+            if expanded:
+                imgui.begin_child("enrich_preview", 0, 200, border=True)
                 
-                imgui.text(lib)
+                # Header
+                imgui.columns(6, "enrich_cols")
+                imgui.set_column_width(0, 120)  # Library
+                imgui.set_column_width(1, 120)  # Object
+                imgui.set_column_width(2, 70)   # .text
+                imgui.set_column_width(3, 70)   # .data
+                imgui.set_column_width(4, 70)   # .rdata
+                imgui.set_column_width(5, 70)   # .bss
+                imgui.text("Library")
                 imgui.next_column()
-                imgui.text(obj)
+                imgui.text("Object")
                 imgui.next_column()
-                
-                text_size = sizes.get(".text", 0)
-                data_size = sizes.get(".data", 0)
-                rdata_size = sizes.get(".rdata", 0)
-                bss_size = sizes.get(".bss", 0)
-                
-                imgui.text(f"0x{text_size:X}" if text_size else "-")
+                imgui.text(".text")
                 imgui.next_column()
-                imgui.text(f"0x{data_size:X}" if data_size else "-")
+                imgui.text(".data")
                 imgui.next_column()
-                imgui.text(f"0x{rdata_size:X}" if rdata_size else "-")
+                imgui.text(".rdata")
                 imgui.next_column()
-                imgui.text(f"0x{bss_size:X}" if bss_size else "-")
+                imgui.text(".bss")
                 imgui.columns(1)
-            
-            imgui.end_child()
+                imgui.separator()
+                
+                # Data rows
+                for (lib, obj), info in sorted(self.enrich_data.items()):
+                    sizes = info.get("section_sizes", {})
+                    imgui.columns(6, f"enrich_{lib}_{obj}")
+                    imgui.set_column_width(0, 120)
+                    imgui.set_column_width(1, 120)
+                    imgui.set_column_width(2, 70)
+                    imgui.set_column_width(3, 70)
+                    imgui.set_column_width(4, 70)
+                    imgui.set_column_width(5, 70)
+                    
+                    imgui.text(lib if lib else "(loose)")
+                    imgui.next_column()
+                    imgui.text(obj)
+                    imgui.next_column()
+                    
+                    text_size = sizes.get(".text", 0)
+                    data_size = sizes.get(".data", 0)
+                    rdata_size = sizes.get(".rdata", 0)
+                    bss_size = sizes.get(".bss", 0)
+                    
+                    imgui.text(f"0x{text_size:X}" if text_size else "-")
+                    imgui.next_column()
+                    imgui.text(f"0x{data_size:X}" if data_size else "-")
+                    imgui.next_column()
+                    imgui.text(f"0x{rdata_size:X}" if rdata_size else "-")
+                    imgui.next_column()
+                    imgui.text(f"0x{bss_size:X}" if bss_size else "-")
+                    imgui.columns(1)
+                
+                imgui.end_child()
     
     def _do_scan_preprocess(self):
         """Preprocess signatures for scanning."""
@@ -2790,10 +3303,16 @@ class PSYQApp:
             filter_parts.append(f"library={library_filter}")
         if version_filter:
             filter_parts.append(f"version={version_filter}")
+        if self.lib_version_overrides:
+            filter_parts.append(f"{len(self.lib_version_overrides)} override(s)")
         filter_msg = f" ({', '.join(filter_parts)})" if filter_parts else ""
         self.status_message = f"Preprocessing signatures{filter_msg}..."
         
-        self.scan_engine.preprocess(library_filter=library_filter, version_filter=version_filter)
+        self.scan_engine.preprocess(
+            library_filter=library_filter, 
+            version_filter=version_filter,
+            lib_version_overrides=self.lib_version_overrides
+        )
         
         self.scan_preprocessed = True
         self.scan_running = False
@@ -3049,41 +3568,43 @@ class PSYQApp:
         if not self.enrich_repo_root or not self.scan_results:
             return
         
-        version_filter = None
+        # Get base version from scan filter (used as default)
+        base_version = None
         if self.scan_version_idx > 0 and self.versions:
-            version_filter = self.versions[self.scan_version_idx - 1]
+            base_version = self.versions[self.scan_version_idx - 1]
         
-        if not version_filter:
-            self.status_message = "Select a specific SDK version for enrichment"
+        if not base_version and not self.lib_version_overrides:
+            self.status_message = "Select a base SDK version or set library version overrides"
             return
         
         repo_root = Path(self.enrich_repo_root).expanduser()
         
-        # Try multiple path structures:
-        # 1. {root}/assets/psyq/{version}/obj/  (decomp project structure)
-        # 2. {root}/{version}/obj/              (standalone SDK structure)
-        # 3. {root}/obj/                        (flat structure)
-        possible_roots = [
-            repo_root / "assets" / "psyq" / version_filter / "obj",
-            repo_root / version_filter / "obj",
-            repo_root / "obj",
-        ]
-        
-        obj_root = None
-        for candidate in possible_roots:
-            if candidate.exists():
-                obj_root = candidate
-                break
-        
-        if not obj_root:
-            tried = ", ".join(str(p) for p in possible_roots)
-            self.status_message = f"Object directory not found. Tried: {tried}"
-            return
-        
-        self.enrich_obj_root = str(obj_root)
         self.enrich_data = {}
         self.enrich_errors = []
+        self.section_verify_cache.clear()  # Clear verification cache
         enriched = 0
+        
+        # Cache obj_roots per version
+        version_obj_roots: dict[str, Path] = {}
+        
+        def get_obj_root(version: str) -> Optional[Path]:
+            """Get the obj root for a specific version."""
+            if version in version_obj_roots:
+                return version_obj_roots[version]
+            
+            # Try multiple path structures
+            possible_roots = [
+                repo_root / "assets" / "psyq" / version / "obj",
+                repo_root / version / "obj",
+                repo_root / "obj",
+            ]
+            
+            for candidate in possible_roots:
+                if candidate.exists():
+                    version_obj_roots[version] = candidate
+                    return candidate
+            
+            return None
         
         for r in self.scan_results:
             # Skip false positives
@@ -3096,11 +3617,38 @@ class PSYQApp:
             if key in self.enrich_data:
                 continue  # Already processed
             
-            lib_folder = lib_to_folder(r.library)
-            obj_file = obj_to_filename(r.object_name)
-            o_path = obj_root / lib_folder / obj_file
+            # Determine version to use for this object
+            # Priority: per-library override > base version > first from scan result
+            lib_key = r.library if r.library else ""  # Empty string for loose objs
+            version = self.lib_version_overrides.get(lib_key) or base_version or (r.versions[0] if r.versions else None)
+            
+            if not version:
+                self.enrich_errors.append(f"No version for {r.library}/{r.object_name}")
+                continue
+            
+            obj_root = get_obj_root(version)
+            if not obj_root:
+                self.enrich_errors.append(f"No obj root for version {version}")
+                continue
+            
+            # Handle loose OBJ files vs library-contained objects
+            # Loose OBJ files have library names like "2MBYTE.OBJ" (not ".LIB")
+            is_loose_obj = r.library and r.library.upper().endswith(".OBJ")
+            
+            if r.library and not is_loose_obj:
+                # Library object: {obj_root}/{lib_folder}/{obj_file}
+                lib_folder = lib_to_folder(r.library)
+                obj_file = obj_to_filename(r.object_name)
+                o_path = obj_root / lib_folder / obj_file
+            else:
+                # Loose object: {obj_root}/{obj_file}
+                # For loose OBJ, library and object name are the same
+                obj_name = r.library if is_loose_obj else r.object_name
+                obj_file = obj_to_filename(obj_name)
+                o_path = obj_root / obj_file
             
             info = enrich_object(o_path)
+            info["version_used"] = version  # Track which version we used
             self.enrich_data[key] = info
             
             if info.get("errors"):
@@ -3108,10 +3656,407 @@ class PSYQApp:
             else:
                 enriched += 1
         
-        self.status_message = f"Enriched {enriched} objects from {obj_root}"
+        # Store the primary obj root for display
+        if base_version:
+            self.enrich_obj_root = str(get_obj_root(base_version) or repo_root)
+        else:
+            self.enrich_obj_root = str(repo_root)
         
-        # Automatically compute blocks after enrichment
-        self._compute_blocks()
+        self.status_message = f"Enriched {enriched} objects"
+        
+        # Initialize section lists from scan results
+        self._init_section_lists()
+    
+    def _init_section_lists(self):
+        """Initialize .data and .rdata section lists from scan results."""
+        # Get valid (non-FP) results sorted by .text offset
+        valid_results = []
+        for r in self.scan_results:
+            if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+            ):
+                continue
+            if r.is_ambiguous:
+                continue
+            valid_results.append(r)
+        
+        valid_results.sort(key=lambda r: r.offset)
+        
+        # Build .data list (objects that have .data sections)
+        self.data_section_list = []
+        for r in valid_results:
+            key = (r.library, r.object_name)
+            info = self.enrich_data.get(key, {})
+            data_size = info.get("section_sizes", {}).get(".data", 0)
+            if data_size > 0:
+                self.data_section_list.append({
+                    "library": r.library,
+                    "object": r.object_name,
+                    "offset": None,  # Not yet resolved
+                    "size": data_size,
+                })
+        
+        # Build .rdata list
+        self.rdata_section_list = []
+        for r in valid_results:
+            key = (r.library, r.object_name)
+            info = self.enrich_data.get(key, {})
+            rdata_size = info.get("section_sizes", {}).get(".rdata", 0)
+            if rdata_size > 0:
+                self.rdata_section_list.append({
+                    "library": r.library,
+                    "object": r.object_name,
+                    "offset": None,
+                    "size": rdata_size,
+                })
+        
+        self.status_message = f"Initialized {len(self.data_section_list)} .data, {len(self.rdata_section_list)} .rdata entries"
+    
+    def _search_single_section(self, library: str, object_name: str, section: str, search_start: int = 0):
+        """
+        Search binary for a single object's .data or .rdata section.
+        Uses relocation masking for accurate matching.
+        """
+        if not self.scan_binary_path or not os.path.exists(self.scan_binary_path):
+            self.status_message = "Binary file not found"
+            return
+        
+        key = (library, object_name)
+        info = self.enrich_data.get(key, {})
+        
+        if not info:
+            self.status_message = f"No enrichment data for {library}/{object_name}"
+            return
+        
+        obj_path = info.get("obj_path", "")
+        if not obj_path or not os.path.exists(obj_path):
+            self.status_message = f"Object file not found: {obj_path}"
+            return
+        
+        section_info = info.get("sections", {}).get(section, {})
+        section_offset = section_info.get("offset", 0)
+        section_size = section_info.get("size", 0)
+        
+        if section_size <= 0:
+            self.status_message = f"No {section} section in {library}/{object_name}"
+            return
+        
+        self.section_search_key = (library, object_name, section)
+        self.section_searching = True
+        self.section_search_results = []
+        
+        # Get relocations
+        relocs = info.get("relocations", {}).get(section, [])
+        
+        # Read object section data
+        try:
+            with open(obj_path, "rb") as f:
+                f.seek(section_offset)
+                obj_data = f.read(section_size)
+        except Exception as e:
+            self.status_message = f"Failed to read object: {e}"
+            self.section_searching = False
+            return
+        
+        # Build mask
+        mask = bytearray(b'\xFF' * section_size)
+        for reloc_offset in relocs:
+            if reloc_offset < section_size:
+                for i in range(4):
+                    if reloc_offset + i < section_size:
+                        mask[reloc_offset + i] = 0x00
+        
+        # Read binary
+        try:
+            with open(self.scan_binary_path, "rb") as f:
+                binary = f.read()
+        except Exception as e:
+            self.status_message = f"Failed to read binary: {e}"
+            self.section_searching = False
+            return
+        
+        # Build anchor from concrete bytes
+        anchor = bytearray()
+        anchor_positions = []
+        for i in range(len(obj_data)):
+            if mask[i] == 0xFF:
+                anchor.append(obj_data[i])
+                anchor_positions.append(i)
+                if len(anchor) >= 16:
+                    break
+        
+        if len(anchor) < 4:
+            self.status_message = f"Not enough concrete bytes to search (too many relocations)"
+            self.section_searching = False
+            return
+        
+        anchor = bytes(anchor)
+        anchor_start_offset = anchor_positions[0] if anchor_positions else 0
+        
+        candidates = []
+        pos = search_start
+        binary_len = len(binary)
+        
+        while pos < binary_len - len(anchor):
+            found_pos = binary.find(anchor, pos)
+            if found_pos == -1:
+                break
+            
+            section_start = found_pos - anchor_start_offset
+            
+            if section_start < 0 or section_start % 4 != 0:
+                pos = found_pos + 1
+                continue
+            
+            # Verify full pattern
+            match_score = 0
+            total_concrete = 0
+            
+            if section_start + section_size <= binary_len:
+                for i in range(section_size):
+                    if mask[i] == 0xFF:
+                        total_concrete += 1
+                        if binary[section_start + i] == obj_data[i]:
+                            match_score += 1
+            
+            if total_concrete > 0:
+                match_pct = (match_score / total_concrete) * 100
+                if match_pct >= 80:
+                    candidates.append((section_start, match_pct))
+            
+            pos = found_pos + 1
+            
+            if len(candidates) >= 20:
+                break
+        
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        self.section_search_results = candidates
+        self.section_searching = False
+        
+        reloc_note = f" ({len(relocs)} relocs)" if relocs else ""
+        if candidates:
+            self.status_message = f"Found {len(candidates)} candidate(s){reloc_note}"
+        else:
+            self.status_message = f"No matches found{reloc_note}"
+    
+    def _chain_section_offset(self, section_list: list[dict], idx: int) -> bool:
+        """
+        Set offset for entry at idx based on previous entry's offset + size.
+        Returns True if successful, False if there's no previous offset.
+        """
+        if idx <= 0:
+            self.status_message = "No previous entry to chain from"
+            return False
+        
+        prev = section_list[idx - 1]
+        if prev["offset"] is None:
+            self.status_message = "Previous entry has no offset set"
+            return False
+        
+        # Compute new offset = prev_offset + prev_size (aligned to 4)
+        new_offset = prev["offset"] + prev["size"]
+        if new_offset % 4 != 0:
+            new_offset += 4 - (new_offset % 4)
+        
+        section_list[idx]["offset"] = new_offset
+        self.status_message = f"Chained: 0x{prev['offset']:X} + 0x{prev['size']:X} = 0x{new_offset:X}"
+        return True
+    
+    def _verify_section_at_offset(self, library: str, object_name: str, section: str, offset: int) -> tuple[float, int, int]:
+        """
+        Verify a section at a specific offset in the binary.
+        Returns (match_pct, matched_bytes, total_concrete_bytes)
+        Uses cache to avoid repeated file I/O on every frame.
+        """
+        # Check cache first
+        cache_key = (library, object_name, section, offset)
+        if cache_key in self.section_verify_cache:
+            return self.section_verify_cache[cache_key]
+        
+        key = (library, object_name)
+        info = self.enrich_data.get(key, {})
+        
+        if not info:
+            return (0.0, 0, 0)
+        
+        obj_path = info.get("obj_path", "")
+        if not obj_path or not os.path.exists(obj_path):
+            return (0.0, 0, 0)
+        
+        section_info = info.get("sections", {}).get(section, {})
+        section_offset = section_info.get("offset", 0)
+        section_size = section_info.get("size", 0)
+        
+        if section_size <= 0:
+            return (0.0, 0, 0)
+        
+        # Read object data
+        try:
+            with open(obj_path, "rb") as f:
+                f.seek(section_offset)
+                obj_data = f.read(section_size)
+        except Exception:
+            return (0.0, 0, 0)
+        
+        # Read binary data
+        try:
+            with open(self.scan_binary_path, "rb") as f:
+                f.seek(offset)
+                bin_data = f.read(section_size)
+        except Exception:
+            return (0.0, 0, 0)
+        
+        # Build mask
+        relocs = info.get("relocations", {}).get(section, [])
+        mask = bytearray(b'\xFF' * section_size)
+        for reloc_offset in relocs:
+            if reloc_offset < section_size:
+                for i in range(4):
+                    if reloc_offset + i < section_size:
+                        mask[reloc_offset + i] = 0x00
+        
+        # Compare
+        match_score = 0
+        total_concrete = 0
+        for i in range(min(len(obj_data), len(bin_data))):
+            if mask[i] == 0xFF:
+                total_concrete += 1
+                if obj_data[i] == bin_data[i]:
+                    match_score += 1
+        
+        if total_concrete > 0:
+            result = (match_score / total_concrete * 100, match_score, total_concrete)
+        else:
+            result = (0.0, 0, 0)
+        
+        # Cache the result
+        self.section_verify_cache[cache_key] = result
+        return result
+    
+    def _invalidate_section_cache(self, library: str = None, object_name: str = None):
+        """Invalidate verification cache entries."""
+        if library is None and object_name is None:
+            # Clear all
+            self.section_verify_cache.clear()
+        else:
+            # Clear matching entries
+            keys_to_remove = [
+                k for k in self.section_verify_cache
+                if (library is None or k[0] == library) and (object_name is None or k[1] == object_name)
+            ]
+            for k in keys_to_remove:
+                del self.section_verify_cache[k]
+    
+    def _move_section_entry(self, section_list: list[dict], idx: int, direction: int):
+        """Move an entry up (direction=-1) or down (direction=1) in the list."""
+        new_idx = idx + direction
+        if 0 <= new_idx < len(section_list):
+            section_list[idx], section_list[new_idx] = section_list[new_idx], section_list[idx]
+    
+    def _compute_section_diff(self, library: str, object_name: str, section: str, binary_offset: int):
+        """
+        Compute detailed diff between the object file section and binary.
+        Stores result in self.section_diff_data for inline display.
+        """
+        key = (library, object_name)
+        info = self.enrich_data.get(key, {})
+        
+        self.section_diff_key = (library, object_name, section, binary_offset)
+        self.section_diff_data = None
+        
+        if not info:
+            self.status_message = f"No enrichment data for {library}/{object_name}"
+            return
+        
+        obj_path = info.get("obj_path", "")
+        if not obj_path or not os.path.exists(obj_path):
+            self.status_message = f"Object file not found: {obj_path}"
+            return
+        
+        section_info = info.get("sections", {}).get(section, {})
+        section_offset = section_info.get("offset", 0)
+        section_size = section_info.get("size", 0)
+        
+        if section_size <= 0:
+            self.status_message = f"No {section} section in object"
+            return
+        
+        # Read object data
+        try:
+            with open(obj_path, "rb") as f:
+                f.seek(section_offset)
+                obj_data = f.read(section_size)
+        except Exception as e:
+            self.status_message = f"Failed to read object: {e}"
+            return
+        
+        # Read binary data
+        try:
+            with open(self.scan_binary_path, "rb") as f:
+                f.seek(binary_offset)
+                bin_data = f.read(section_size)
+        except Exception as e:
+            self.status_message = f"Failed to read binary: {e}"
+            return
+        
+        # Build mask
+        relocs = info.get("relocations", {}).get(section, [])
+        mask = bytearray(b'\xFF' * section_size)
+        for reloc_offset in relocs:
+            if reloc_offset < section_size:
+                for i in range(4):
+                    if reloc_offset + i < section_size:
+                        mask[reloc_offset + i] = 0x00
+        
+        # Count stats and collect mismatches
+        match_count = 0
+        mismatch_count = 0
+        wildcard_count = 0
+        mismatches = []
+        
+        for i in range(section_size):
+            obj_byte = obj_data[i] if i < len(obj_data) else 0
+            bin_byte = bin_data[i] if i < len(bin_data) else 0
+            is_wildcard = mask[i] == 0x00
+            
+            if is_wildcard:
+                wildcard_count += 1
+            elif obj_byte == bin_byte:
+                match_count += 1
+            else:
+                mismatch_count += 1
+                mismatches.append({
+                    "offset": i,
+                    "binary_offset": binary_offset + i,
+                    "obj_byte": obj_byte,
+                    "bin_byte": bin_byte,
+                })
+        
+        total_concrete = match_count + mismatch_count
+        match_pct = (match_count / total_concrete * 100) if total_concrete > 0 else 0
+        
+        # Store for inline display
+        self.section_diff_data = {
+            "library": library,
+            "object": object_name,
+            "section": section,
+            "binary_offset": binary_offset,
+            "section_size": section_size,
+            "version_used": info.get("version_used", "unknown"),
+            "relocs": relocs,
+            "match_count": match_count,
+            "mismatch_count": mismatch_count,
+            "wildcard_count": wildcard_count,
+            "match_pct": match_pct,
+            "mismatches": mismatches[:50],  # Limit for display
+            "total_mismatches": len(mismatches),
+            "obj_data": obj_data,
+            "bin_data": bin_data,
+            "mask": bytes(mask),
+        }
+        
+        self.status_message = f"Diff computed: {match_pct:.1f}% match, {mismatch_count} mismatches"
     
     def _compute_blocks(self):
         """
@@ -3374,6 +4319,193 @@ class PSYQApp:
         else:
             self.status_message = f"No matches found for block {block_idx + 1} {section}"
     
+    def _dump_block_section_debug(self, block_idx: int, section: str, binary_offset: int):
+        """
+        Dump detailed debug info about a block's section matching.
+        Writes to a file next to the binary for analysis.
+        """
+        if block_idx >= len(self.blocks):
+            return
+        
+        block = self.blocks[block_idx]
+        
+        # Read binary
+        try:
+            with open(self.scan_binary_path, "rb") as f:
+                binary = f.read()
+        except Exception as e:
+            self.status_message = f"Failed to read binary: {e}"
+            return
+        
+        debug_path = f"{self.scan_binary_path}_block{block_idx + 1}_{section.strip('.')}_debug.txt"
+        
+        try:
+            with open(debug_path, "w") as out:
+                out.write(f"=== Block {block_idx + 1} {section} Debug Dump ===\n")
+                out.write(f"Binary offset: 0x{binary_offset:X}\n")
+                out.write(f"Objects in block: {len(block['objects'])}\n\n")
+                
+                current_binary_offset = binary_offset
+                total_mismatches = 0
+                total_concrete = 0
+                total_wildcards = 0
+                
+                for r in block["objects"]:
+                    key = (r.library, r.object_name)
+                    info = self.enrich_data.get(key, {})
+                    
+                    obj_path = info.get("obj_path", "")
+                    if not obj_path or not os.path.exists(obj_path):
+                        out.write(f"\n--- {r.library}/{r.object_name} ---\n")
+                        out.write(f"  ERROR: Object file not found: {obj_path}\n")
+                        continue
+                    
+                    section_info = info.get("sections", {}).get(section, {})
+                    section_offset = section_info.get("offset", 0)
+                    section_size = section_info.get("size", 0)
+                    
+                    if section_size <= 0:
+                        continue
+                    
+                    # Get relocations from enrichment data
+                    relocs = info.get("relocations", {}).get(section, [])
+                    
+                    out.write(f"\n--- {r.library}/{r.object_name} ---\n")
+                    out.write(f"  Object file: {obj_path}\n")
+                    out.write(f"  Section {section}: offset=0x{section_offset:X}, size=0x{section_size:X} ({section_size} bytes)\n")
+                    out.write(f"  Binary offset: 0x{current_binary_offset:X}\n")
+                    out.write(f"  Relocations from enrichment: {relocs}\n")
+                    
+                    # Re-parse the ELF to get more details
+                    if PYELFTOOLS_AVAILABLE:
+                        try:
+                            with open(obj_path, 'rb') as elf_f:
+                                from elftools.elf.elffile import ELFFile
+                                from elftools.elf.relocation import RelocationSection
+                                elf = ELFFile(elf_f)
+                                
+                                out.write(f"  ELF sections in file:\n")
+                                for sec in elf.iter_sections():
+                                    if sec.name:
+                                        out.write(f"    {sec.name}: size=0x{sec['sh_size']:X}, offset=0x{sec['sh_offset']:X}\n")
+                                
+                                out.write(f"  Relocation sections:\n")
+                                for sec in elf.iter_sections():
+                                    if isinstance(sec, RelocationSection):
+                                        out.write(f"    {sec.name}: {sec.num_relocations()} entries\n")
+                                        # Show details for the section we care about
+                                        target = section
+                                        if sec.name == f".rel{section}" or sec.name == f".rela{section}":
+                                            out.write(f"      Relocation entries for {section}:\n")
+                                            for i, reloc in enumerate(sec.iter_relocations()):
+                                                r_offset = reloc['r_offset']
+                                                r_info = reloc['r_info']
+                                                r_type = r_info & 0xFF
+                                                r_sym = r_info >> 8
+                                                out.write(f"        [{i}] offset=0x{r_offset:X}, type={r_type}, sym={r_sym}\n")
+                        except Exception as e:
+                            out.write(f"  ERROR re-parsing ELF: {e}\n")
+                    
+                    # Read object section data
+                    try:
+                        with open(obj_path, "rb") as f:
+                            f.seek(section_offset)
+                            obj_data = f.read(section_size)
+                    except Exception as e:
+                        out.write(f"  ERROR reading object: {e}\n")
+                        continue
+                    
+                    # Build mask
+                    mask = bytearray(b'\xFF' * section_size)
+                    for reloc_offset in relocs:
+                        if reloc_offset < section_size:
+                            for i in range(4):
+                                if reloc_offset + i < section_size:
+                                    mask[reloc_offset + i] = 0x00
+                    
+                    # Compare byte by byte
+                    mismatches = []
+                    wildcards = 0
+                    concrete = 0
+                    
+                    for i in range(section_size):
+                        bin_offset = current_binary_offset + i
+                        if bin_offset >= len(binary):
+                            out.write(f"  ERROR: Binary offset 0x{bin_offset:X} out of range\n")
+                            break
+                        
+                        obj_byte = obj_data[i]
+                        bin_byte = binary[bin_offset]
+                        is_wildcard = mask[i] == 0x00
+                        
+                        if is_wildcard:
+                            wildcards += 1
+                            total_wildcards += 1
+                        else:
+                            concrete += 1
+                            total_concrete += 1
+                            if obj_byte != bin_byte:
+                                mismatches.append({
+                                    "offset_in_section": i,
+                                    "binary_offset": bin_offset,
+                                    "obj_byte": obj_byte,
+                                    "bin_byte": bin_byte,
+                                })
+                                total_mismatches += 1
+                    
+                    out.write(f"  Concrete bytes: {concrete}, Wildcards: {wildcards}\n")
+                    out.write(f"  Mismatches: {len(mismatches)}\n")
+                    
+                    if mismatches:
+                        out.write(f"  Mismatch details:\n")
+                        for mm in mismatches[:50]:  # Limit output
+                            out.write(f"    @0x{mm['offset_in_section']:04X} (bin 0x{mm['binary_offset']:08X}): "
+                                     f"obj=0x{mm['obj_byte']:02X} bin=0x{mm['bin_byte']:02X}\n")
+                        if len(mismatches) > 50:
+                            out.write(f"    ... and {len(mismatches) - 50} more\n")
+                    
+                    # Also dump a hex view of the first few bytes for visual comparison
+                    out.write(f"  First 64 bytes comparison (W=wildcard, M=mismatch, .=match):\n")
+                    out.write(f"    Offset   Obj                                               Bin                                               Mask\n")
+                    for row_start in range(0, min(64, section_size), 16):
+                        obj_hex = ""
+                        bin_hex = ""
+                        mask_str = ""
+                        for i in range(16):
+                            idx = row_start + i
+                            if idx >= section_size:
+                                break
+                            bin_offset = current_binary_offset + idx
+                            obj_b = obj_data[idx] if idx < len(obj_data) else 0
+                            bin_b = binary[bin_offset] if bin_offset < len(binary) else 0
+                            is_wc = mask[idx] == 0x00
+                            
+                            obj_hex += f"{obj_b:02X} "
+                            bin_hex += f"{bin_b:02X} "
+                            if is_wc:
+                                mask_str += "W "
+                            elif obj_b != bin_b:
+                                mask_str += "M "
+                            else:
+                                mask_str += ". "
+                        out.write(f"    0x{row_start:04X}  {obj_hex:<48} {bin_hex:<48} {mask_str}\n")
+                    
+                    current_binary_offset += section_size
+                
+                # Summary
+                out.write(f"\n=== SUMMARY ===\n")
+                out.write(f"Total concrete bytes: {total_concrete}\n")
+                out.write(f"Total wildcards: {total_wildcards}\n")
+                out.write(f"Total mismatches: {total_mismatches}\n")
+                if total_concrete > 0:
+                    match_pct = ((total_concrete - total_mismatches) / total_concrete) * 100
+                    out.write(f"Match percentage: {match_pct:.2f}%\n")
+            
+            self.status_message = f"Debug dump written to {debug_path}"
+        
+        except Exception as e:
+            self.status_message = f"Failed to write debug dump: {e}"
+    
     def _set_block_offset(self, block_idx: int, section: str, offset: int):
         """Set the resolved offset for a block's section."""
         if section == ".data":
@@ -3457,9 +4589,16 @@ class PSYQApp:
         if self.scan_version_idx > 0 and self.versions:
             version_filter = self.versions[self.scan_version_idx - 1]
         
-        # Compute resolved offsets if we have block resolutions
-        data_offsets = self._compute_section_offsets(".data")
-        rdata_offsets = self._compute_section_offsets(".rdata")
+        # Build offset dicts from the new section lists
+        data_offsets: dict[tuple[str, str], int] = {}
+        for entry in self.data_section_list:
+            if entry["offset"] is not None:
+                data_offsets[(entry["library"], entry["object"])] = entry["offset"]
+        
+        rdata_offsets: dict[tuple[str, str], int] = {}
+        for entry in self.rdata_section_list:
+            if entry["offset"] is not None:
+                rdata_offsets[(entry["library"], entry["object"])] = entry["offset"]
         
         has_resolved_data = bool(data_offsets)
         has_resolved_rdata = bool(rdata_offsets)
@@ -3498,16 +4637,14 @@ class PSYQApp:
                     
                     block_idx = result_to_block.get(r.offset, -1)
                     
-                    # Check if we're starting a new block
+                    # Add gap (asm) if there's space between previous end and this offset
+                    if prev_end is not None and r.offset > prev_end:
+                        gap_size = r.offset - prev_end
+                        if gap_size > 0:
+                            f.write(f"      - [0x{prev_end:X}, asm]  # gap: 0x{gap_size:X}\n")
+                    
+                    # Block comment when entering a new block
                     if block_idx != last_block_idx and block_idx >= 0:
-                        # Add gap (asm) before this block if we have a previous end
-                        if prev_end is not None and r.offset > prev_end:
-                            gap_size = r.offset - prev_end
-                            if gap_size > 0:
-                                f.write(f"\n      # --- game code (0x{gap_size:X} bytes) ---\n")
-                                f.write(f"      - [0x{prev_end:X}, asm]\n\n")
-                        
-                        # Block comment
                         if self.blocks and block_idx < len(self.blocks):
                             block = self.blocks[block_idx]
                             f.write(f"      # --- PSYQ Block {block_idx + 1} ({len(block['objects'])} objects) ---\n")
@@ -3515,13 +4652,61 @@ class PSYQApp:
                     last_block_idx = block_idx
                     
                     obj_stem = Path(r.object_name).stem
-                    lib_name = r.library.replace('.LIB', '')
+                    lib_name = r.library.replace('.LIB', '') if r.library else "LOOSE"
                     f.write(f"      - [0x{r.offset:X}, lib, {lib_name}, {obj_stem}, .text]\n")
                     
                     prev_end = r.offset + text_size
                 
-                # Helper function to write section with block comments
-                def write_section_with_blocks(section_name: str, offsets_dict: dict):
+                # Helper function to write section using the section list ordering
+                def write_section_from_list(section_name: str, section_list: list[dict], offsets_dict: dict):
+                    if not section_list:
+                        return
+                    
+                    # Determine gap type based on section
+                    if section_name == ".data":
+                        gap_type = "data"
+                    elif section_name == ".rdata":
+                        gap_type = "rodata"
+                    else:
+                        gap_type = "data"  # fallback
+                    
+                    f.write(f"\n      # === {section_name} segments ===\n")
+                    
+                    prev_end = None
+                    
+                    for entry in section_list:
+                        lib = entry["library"]
+                        obj = entry["object"]
+                        size = entry["size"]
+                        
+                        obj_stem = Path(obj).stem
+                        lib_name = lib.replace('.LIB', '') if lib else "LOOSE"
+                        
+                        # Use resolved offset if available
+                        key = (lib, obj)
+                        if key in offsets_dict:
+                            offset = offsets_dict[key]
+                            
+                            # Add gap entry if there's space between previous end and this offset
+                            if prev_end is not None and offset > prev_end:
+                                gap_size = offset - prev_end
+                                f.write(f"      - [0x{prev_end:X}, {gap_type}]  # gap: 0x{gap_size:X}\n")
+                            
+                            f.write(f"      - [0x{offset:X}, lib, {lib_name}, {obj_stem}, {section_name}]  # size: 0x{size:X}\n")
+                            
+                            # Update prev_end (align to 4 bytes)
+                            prev_end = offset + size
+                            prev_end = (prev_end + 3) & ~3  # align up to 4
+                        else:
+                            # No resolved offset - can't track gaps
+                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, {section_name}]  # size: 0x{size:X}\n")
+                
+                # Write .data and .rdata using the new section lists
+                write_section_from_list(".data", self.data_section_list, data_offsets)
+                write_section_from_list(".rdata", self.rdata_section_list, rdata_offsets)
+                
+                # For other sections, use the old approach (still based on .text order)
+                def write_section_auto(section_name: str):
                     has_any = any(
                         self.enrich_data.get((r.library, r.object_name), {}).get("section_sizes", {}).get(section_name, 0) > 0
                         for r in valid_results
@@ -3530,7 +4715,6 @@ class PSYQApp:
                         return
                     
                     f.write(f"\n      # === {section_name} segments ===\n")
-                    last_blk = -1
                     
                     for r in valid_results:
                         key = (r.library, r.object_name)
@@ -3539,33 +4723,14 @@ class PSYQApp:
                         if size <= 0:
                             continue
                         
-                        block_idx = result_to_block.get(r.offset, -1)
-                        
-                        # Block separator
-                        if block_idx != last_blk and block_idx >= 0:
-                            if last_blk >= 0:
-                                f.write(f"\n")  # Blank line between blocks
-                            if self.blocks and block_idx < len(self.blocks):
-                                f.write(f"      # --- Block {block_idx + 1} ---\n")
-                        last_blk = block_idx
-                        
                         obj_stem = Path(r.object_name).stem
-                        lib_name = r.library.replace('.LIB', '')
+                        lib_name = r.library.replace('.LIB', '') if r.library else "LOOSE"
                         
-                        # Use resolved offset if available
-                        if key in offsets_dict:
-                            offset_str = f"0x{offsets_dict[key]:X}"
-                        else:
-                            offset_str = "auto"
-                        
-                        f.write(f"      - [{offset_str}, lib, {lib_name}, {obj_stem}, {section_name}]  # size: 0x{size:X}\n")
+                        f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, {section_name}]  # size: 0x{size:X}\n")
                 
-                # Write .data, .rdata, .sdata, .sbss, .bss sections
-                write_section_with_blocks(".data", data_offsets)
-                write_section_with_blocks(".rdata", rdata_offsets)
-                write_section_with_blocks(".sdata", {})
-                write_section_with_blocks(".sbss", {})
-                write_section_with_blocks(".bss", {})
+                write_section_auto(".sdata")
+                write_section_auto(".sbss")
+                write_section_auto(".bss")
             
             self.status_message = f"Exported Splat YAML to {export_path}"
         except Exception as e:
@@ -3837,6 +5002,333 @@ class PSYQApp:
         
         imgui.end_child()
     
+    def render_verify_splat_tab(self):
+        """Render the Splat YAML verification tab."""
+        imgui.text("Verify Splat YAML against binary and SDK objects")
+        imgui.separator()
+        
+        # Check prerequisites
+        if not PYELFTOOLS_AVAILABLE:
+            imgui.text_colored(
+                "pyelftools not installed - run: pip install pyelftools",
+                1.0, 0.5, 0.3, 1.0
+            )
+            return
+        
+        # Input: Splat YAML path
+        imgui.text("Splat YAML file:")
+        _, self.verify_splat_path = imgui.input_text(
+            "##verify_splat_path", self.verify_splat_path, 512
+        )
+        
+        # Binary path (reuse from scan)
+        imgui.text(f"Binary: {self.scan_binary_path or '(set in Scan Binary tab)'}")
+        
+        # SDK root (reuse from enrich)
+        imgui.text(f"SDK Root: {self.enrich_repo_root or '(set in Enrich & Export tab)'}")
+        
+        imgui.separator()
+        
+        # Version overrides info
+        if self.lib_version_overrides:
+            imgui.text_colored(
+                f"Using {len(self.lib_version_overrides)} library version override(s)",
+                0.8, 0.8, 0.3, 1.0
+            )
+        
+        # Verify button
+        can_verify = (
+            self.verify_splat_path 
+            and os.path.exists(self.verify_splat_path)
+            and self.scan_binary_path
+            and os.path.exists(self.scan_binary_path)
+            and self.enrich_repo_root
+        )
+        
+        if can_verify:
+            if imgui.button("Verify Splat YAML", width=180):
+                self._do_verify_splat()
+        else:
+            imgui.text_colored(
+                "Set Splat YAML path, binary path (Scan tab), and SDK root (Enrich tab)",
+                0.5, 0.5, 0.5, 1.0
+            )
+        
+        imgui.separator()
+        
+        # Results
+        if self.verify_results:
+            # Summary
+            total = len(self.verify_results)
+            perfect = sum(1 for r in self.verify_results if r.get("match_pct", 0) >= 99.9)
+            good = sum(1 for r in self.verify_results if 90 <= r.get("match_pct", 0) < 99.9)
+            bad = sum(1 for r in self.verify_results if r.get("match_pct", 0) < 90)
+            errors = sum(1 for r in self.verify_results if r.get("error"))
+            
+            imgui.text(f"Results: {total} entries")
+            imgui.same_line()
+            imgui.text_colored(f"[{perfect} perfect]", 0.3, 1.0, 0.3, 1.0)
+            imgui.same_line()
+            imgui.text_colored(f"[{good} good]", 0.8, 1.0, 0.3, 1.0)
+            imgui.same_line()
+            imgui.text_colored(f"[{bad} bad]", 1.0, 0.5, 0.3, 1.0)
+            if errors > 0:
+                imgui.same_line()
+                imgui.text_colored(f"[{errors} errors]", 1.0, 0.3, 0.3, 1.0)
+            
+            imgui.begin_child("verify_results", 0, 0, border=True)
+            
+            # Header
+            imgui.columns(6, "verify_cols")
+            imgui.set_column_width(0, 90)   # Offset
+            imgui.set_column_width(1, 100)  # Library
+            imgui.set_column_width(2, 100)  # Object
+            imgui.set_column_width(3, 60)   # Section
+            imgui.set_column_width(4, 60)   # Match%
+            imgui.text("Offset")
+            imgui.next_column()
+            imgui.text("Library")
+            imgui.next_column()
+            imgui.text("Object")
+            imgui.next_column()
+            imgui.text("Section")
+            imgui.next_column()
+            imgui.text("Match")
+            imgui.next_column()
+            imgui.text("Status")
+            imgui.columns(1)
+            imgui.separator()
+            
+            for result in self.verify_results:
+                row_id = f"vfy_{result['offset']}_{result['object']}"
+                
+                imgui.columns(6, row_id)
+                imgui.set_column_width(0, 90)
+                imgui.set_column_width(1, 100)
+                imgui.set_column_width(2, 100)
+                imgui.set_column_width(3, 60)
+                imgui.set_column_width(4, 60)
+                
+                # Offset
+                if result.get("error"):
+                    imgui.text_colored(f"0x{result['offset']:X}", 1.0, 0.3, 0.3, 1.0)
+                else:
+                    imgui.text(f"0x{result['offset']:X}")
+                imgui.next_column()
+                
+                # Library
+                imgui.text(result.get("library", ""))
+                imgui.next_column()
+                
+                # Object
+                imgui.text(result.get("object", ""))
+                imgui.next_column()
+                
+                # Section
+                imgui.text(result.get("section", ""))
+                imgui.next_column()
+                
+                # Match percentage
+                match_pct = result.get("match_pct", 0)
+                if result.get("error"):
+                    imgui.text_colored("-", 1.0, 0.3, 0.3, 1.0)
+                elif match_pct >= 99.9:
+                    imgui.text_colored(f"{match_pct:.1f}%", 0.3, 1.0, 0.3, 1.0)
+                elif match_pct >= 90:
+                    imgui.text_colored(f"{match_pct:.1f}%", 0.8, 1.0, 0.3, 1.0)
+                else:
+                    imgui.text_colored(f"{match_pct:.1f}%", 1.0, 0.5, 0.3, 1.0)
+                imgui.next_column()
+                
+                # Status
+                if result.get("error"):
+                    imgui.text_colored(result["error"], 1.0, 0.3, 0.3, 1.0)
+                elif match_pct >= 99.9:
+                    imgui.text_colored("OK", 0.3, 1.0, 0.3, 1.0)
+                elif match_pct >= 90:
+                    imgui.text_colored("Close", 0.8, 1.0, 0.3, 1.0)
+                else:
+                    imgui.text_colored("Mismatch", 1.0, 0.5, 0.3, 1.0)
+                
+                imgui.columns(1)
+                imgui.separator()
+            
+            imgui.end_child()
+    
+    def _do_verify_splat(self):
+        """Parse and verify a Splat YAML file."""
+        self.verify_results = []
+        
+        # Parse the YAML
+        try:
+            import yaml
+        except ImportError:
+            self.status_message = "PyYAML not installed - run: pip install pyyaml"
+            return
+        
+        try:
+            with open(self.verify_splat_path) as f:
+                content = f.read()
+        except Exception as e:
+            self.status_message = f"Failed to read Splat YAML: {e}"
+            return
+        
+        # Parse lib entries manually (the format is list-based, not standard YAML)
+        # Format: - [0x1234, lib, LIBNAME, OBJNAME, .section]
+        import re
+        lib_pattern = re.compile(r'\[\s*0x([0-9A-Fa-f]+)\s*,\s*lib\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\.\w+)\s*\]')
+        
+        entries = []
+        for line in content.split('\n'):
+            match = lib_pattern.search(line)
+            if match:
+                offset = int(match.group(1), 16)
+                library = match.group(2) + ".LIB"  # Add .LIB back
+                obj = match.group(3) + ".OBJ"      # Add .OBJ back
+                section = match.group(4)
+                entries.append({
+                    "offset": offset,
+                    "library": library,
+                    "object": obj,
+                    "section": section,
+                })
+        
+        if not entries:
+            self.status_message = "No lib entries found in Splat YAML"
+            return
+        
+        # Get base version
+        base_version = None
+        if self.scan_version_idx > 0 and self.versions:
+            base_version = self.versions[self.scan_version_idx - 1]
+        
+        repo_root = Path(self.enrich_repo_root).expanduser()
+        
+        # Cache obj roots per version
+        def get_obj_root(version: str) -> Optional[Path]:
+            possible_roots = [
+                repo_root / "assets" / "psyq" / version / "obj",
+                repo_root / version / "obj",
+                repo_root / "obj",
+            ]
+            for candidate in possible_roots:
+                if candidate.exists():
+                    return candidate
+            return None
+        
+        # Read binary
+        try:
+            with open(self.scan_binary_path, "rb") as f:
+                binary = f.read()
+        except Exception as e:
+            self.status_message = f"Failed to read binary: {e}"
+            return
+        
+        # Verify each entry
+        for entry in entries:
+            result = dict(entry)
+            
+            # Get version for this library
+            lib_key = entry["library"]
+            version = self.lib_version_overrides.get(lib_key) or base_version
+            
+            if not version:
+                result["error"] = "No version"
+                self.verify_results.append(result)
+                continue
+            
+            obj_root = get_obj_root(version)
+            if not obj_root:
+                result["error"] = f"No obj root for {version}"
+                self.verify_results.append(result)
+                continue
+            
+            # Find object file
+            # Check if this is a loose OBJ file (library name ends with .OBJ)
+            is_loose_obj = entry["library"].upper().endswith(".OBJ")
+            
+            if is_loose_obj:
+                # Loose OBJ: file is at root level
+                obj_file = obj_to_filename(entry["library"])  # Use library name as file name
+                o_path = obj_root / obj_file
+            else:
+                # Library object: {obj_root}/{lib_folder}/{obj_file}
+                lib_folder = lib_to_folder(entry["library"])
+                obj_file = obj_to_filename(entry["object"])
+                o_path = obj_root / lib_folder / obj_file
+                
+                if not o_path.exists():
+                    # Fallback: try as loose obj
+                    o_path = obj_root / obj_file
+            
+            if not o_path.exists():
+                result["error"] = "Obj not found"
+                self.verify_results.append(result)
+                continue
+            
+            # Get ELF section info
+            info = enrich_object(o_path)
+            if info.get("errors"):
+                result["error"] = "ELF error"
+                self.verify_results.append(result)
+                continue
+            
+            section_info = info.get("sections", {}).get(entry["section"], {})
+            section_offset = section_info.get("offset", 0)
+            section_size = section_info.get("size", 0)
+            
+            if section_size <= 0:
+                result["error"] = f"No {entry['section']}"
+                self.verify_results.append(result)
+                continue
+            
+            # Read section from object
+            try:
+                with open(o_path, "rb") as f:
+                    f.seek(section_offset)
+                    obj_data = f.read(section_size)
+            except Exception:
+                result["error"] = "Read error"
+                self.verify_results.append(result)
+                continue
+            
+            # Get relocations for masking
+            relocs = info.get("relocations", {}).get(entry["section"], [])
+            mask = bytearray(b'\xFF' * section_size)
+            for reloc_offset in relocs:
+                if reloc_offset < section_size:
+                    for i in range(4):
+                        if reloc_offset + i < section_size:
+                            mask[reloc_offset + i] = 0x00
+            
+            # Compare with binary
+            bin_offset = entry["offset"]
+            if bin_offset + section_size > len(binary):
+                result["error"] = "Out of range"
+                self.verify_results.append(result)
+                continue
+            
+            match_score = 0
+            total_concrete = 0
+            for i in range(section_size):
+                if mask[i] == 0xFF:
+                    total_concrete += 1
+                    if binary[bin_offset + i] == obj_data[i]:
+                        match_score += 1
+            
+            if total_concrete > 0:
+                result["match_pct"] = (match_score / total_concrete) * 100
+            else:
+                result["match_pct"] = 100.0  # All wildcards
+            
+            result["matched"] = match_score
+            result["total"] = total_concrete
+            result["size"] = section_size
+            
+            self.verify_results.append(result)
+        
+        self.status_message = f"Verified {len(entries)} entries"
+    
     def render_cache_tab(self):
         """Render the cache management tab."""
         imgui.text("Cache Management")
@@ -3918,6 +5410,10 @@ class PSYQApp:
             
             if imgui.begin_tab_item("Enrich & Export")[0]:
                 self.render_enrich_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Verify Splat")[0]:
+                self.render_verify_splat_tab()
                 imgui.end_tab_item()
             
             if imgui.begin_tab_item("Library Explorer")[0]:
