@@ -337,6 +337,82 @@ class SDKManager:
 # False Positive Store
 # =============================================================================
 
+class PersistentConfig:
+    """
+    Persists user configuration across sessions.
+    
+    Stores paths, preferences, and other settings that should be remembered.
+    """
+    
+    FILENAME = "config.json"
+    
+    def __init__(self, cache_dir: Path = CACHE_DIR):
+        self.cache_dir = cache_dir
+        self._config: dict = {}
+        self._load()
+    
+    def _store_path(self) -> Path:
+        return self.cache_dir / self.FILENAME
+    
+    def _load(self) -> None:
+        path = self._store_path()
+        if path.exists():
+            try:
+                with open(path) as f:
+                    self._config = json.load(f)
+            except Exception:
+                self._config = {}
+    
+    def _save(self) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._store_path(), "w") as f:
+            json.dump(self._config, f, indent=2)
+    
+    def get(self, key: str, default=None):
+        """Get a config value."""
+        return self._config.get(key, default)
+    
+    def set(self, key: str, value) -> None:
+        """Set a config value and persist."""
+        self._config[key] = value
+        self._save()
+    
+    def get_path(self, key: str) -> str:
+        """Get a path config, returning empty string if not set."""
+        return self._config.get(key, "")
+    
+    def set_path(self, key: str, value: str) -> None:
+        """Set a path config if non-empty."""
+        if value:
+            self._config[key] = value
+            self._save()
+    
+    # Convenience methods for common paths
+    @property
+    def binary_path(self) -> str:
+        return self.get_path("binary_path")
+    
+    @binary_path.setter
+    def binary_path(self, value: str):
+        self.set_path("binary_path", value)
+    
+    @property
+    def repo_root(self) -> str:
+        return self.get_path("repo_root")
+    
+    @repo_root.setter
+    def repo_root(self, value: str):
+        self.set_path("repo_root", value)
+    
+    @property
+    def sdk_version(self) -> str:
+        return self.get_path("sdk_version")
+    
+    @sdk_version.setter
+    def sdk_version(self, value: str):
+        self.set_path("sdk_version", value)
+
+
 class FalsePositiveStore:
     """
     Persists false positive dismissals for scan results.
@@ -451,6 +527,318 @@ class FalsePositiveStore:
         if fingerprint in self._store:
             del self._store[fingerprint]
             self._save()
+
+
+# =============================================================================
+# Object Database (for symbol resolution and data-only object tracking)
+# =============================================================================
+
+@dataclass
+class ObjectInfo:
+    """Complete information about an SDK object file."""
+    library: str           # e.g., "LIBSPU.LIB" or "2MBYTE.OBJ" for loose
+    name: str              # e.g., "S_RMP0.OBJ"
+    version: str           # e.g., "450"
+    obj_path: str          # Path to the .o file
+    
+    # Section info from ELF: section_name -> {offset, size, type, flags}
+    # offset here is the offset WITHIN the .o file
+    sections: dict = field(default_factory=dict)
+    
+    # Section binary placements: section_name -> offset in binary (None if not resolved)
+    section_offsets: dict = field(default_factory=dict)
+    
+    # Symbols
+    defined_symbols: dict = field(default_factory=dict)   # name -> {section, offset, size, type}
+    undefined_symbols: list = field(default_factory=list)  # [name, ...]
+    common_symbols: dict = field(default_factory=dict)     # name -> {size} (become .bss)
+    
+    # Relocations per section
+    relocations: dict = field(default_factory=dict)  # section -> [offsets]
+    
+    # Binary presence tracking
+    text_found: bool = False           # Was .text found via scanning?
+    in_binary: bool = False            # Is this object in the binary?
+    found_via: str = ""                # "text_scan" or "symbol_reference"
+    pulled_in_by: list = field(default_factory=list)  # Objects that reference this one
+    
+    def has_section(self, section: str) -> bool:
+        """Check if object has a non-empty section."""
+        return self.sections.get(section, {}).get("size", 0) > 0
+    
+    def section_size(self, section: str) -> int:
+        """Get size of a section."""
+        return self.sections.get(section, {}).get("size", 0)
+    
+    def get_binary_offset(self, section: str) -> Optional[int]:
+        """Get binary offset for a section."""
+        return self.section_offsets.get(section)
+    
+    def set_binary_offset(self, section: str, offset: int):
+        """Set binary offset for a section."""
+        self.section_offsets[section] = offset
+
+
+class ObjectDatabase:
+    """
+    Database of all SDK objects with symbol resolution capability.
+    
+    Enables:
+    - Finding which object defines a given symbol
+    - Tracking which objects are "pulled in" by reference
+    - Building complete section lists including data-only objects
+    """
+    
+    def __init__(self):
+        # All objects: (library, object_name) -> ObjectInfo
+        self.objects: dict[tuple[str, str], ObjectInfo] = {}
+        
+        # Symbol lookup: symbol_name -> [(library, object_name), ...]
+        # Multiple objects might define the same symbol in different versions
+        self._symbol_index: dict[str, list[tuple[str, str]]] = {}
+        
+        # Track loading state
+        self.loaded_version: Optional[str] = None
+        self.obj_root: Optional[Path] = None
+    
+    def clear(self):
+        """Clear all loaded data."""
+        self.objects.clear()
+        self._symbol_index.clear()
+        self.loaded_version = None
+        self.obj_root = None
+    
+    def load_objects_for_version(
+        self, 
+        version: str, 
+        obj_root: Path, 
+        sdk_manager=None,  # No longer required
+        progress_callback=None
+    ) -> int:
+        """
+        Load all objects for a given SDK version by enumerating actual .o files.
+        
+        This scans the filesystem directly rather than relying on SDK JSON,
+        so it finds ALL objects including those without .text sections.
+        
+        Returns number of objects loaded.
+        """
+        self.clear()
+        self.loaded_version = version
+        self.obj_root = obj_root
+        
+        if not obj_root.exists():
+            return 0
+        
+        loaded = 0
+        
+        # Enumerate all .o files in obj_root
+        # Structure: obj_root/{lib_folder}/{obj}.o  (for library objects)
+        #            obj_root/{obj}.o               (for loose objects)
+        
+        all_o_files = list(obj_root.rglob("*.o"))
+        
+        for file_idx, o_path in enumerate(all_o_files):
+            if progress_callback and file_idx % 50 == 0:
+                progress_callback(f"Loading {o_path.name}...", file_idx / max(len(all_o_files), 1))
+            
+            # Determine library from path
+            # If .o is directly in obj_root, it's a loose object
+            # Otherwise, parent folder is the library folder
+            rel_path = o_path.relative_to(obj_root)
+            parts = rel_path.parts
+            
+            if len(parts) == 1:
+                # Loose object: e.g., obj_root/2mbyte.o
+                lib_name = o_path.stem.upper() + ".OBJ"  # "2MBYTE.OBJ"
+                obj_name = lib_name
+            else:
+                # Library object: e.g., obj_root/libspu/s_rmp0.o
+                lib_folder = parts[0]  # "libspu"
+                lib_name = lib_folder.upper() + ".LIB"  # "LIBSPU.LIB"
+                obj_name = o_path.stem.upper() + ".OBJ"  # "S_RMP0.OBJ"
+            
+            key = (lib_name, obj_name)
+            
+            # Skip if already loaded (shouldn't happen, but be safe)
+            if key in self.objects:
+                continue
+            
+            # Create ObjectInfo
+            obj_info = ObjectInfo(
+                library=lib_name,
+                name=obj_name,
+                version=version,
+                obj_path=str(o_path),
+            )
+            
+            # Load ELF data
+            try:
+                elf_data = enrich_object(o_path)
+                obj_info.sections = elf_data.get("sections", {})
+                obj_info.relocations = elf_data.get("relocations", {})
+                
+                # Get symbol summary
+                sym_summary = parse_elf_symbols_summary(o_path)
+                obj_info.defined_symbols = sym_summary.get("defined", {})
+                obj_info.undefined_symbols = sym_summary.get("undefined", [])
+                obj_info.common_symbols = sym_summary.get("common", {})
+                
+                # Index defined symbols for lookup
+                for sym_name in obj_info.defined_symbols:
+                    if sym_name not in self._symbol_index:
+                        self._symbol_index[sym_name] = []
+                    self._symbol_index[sym_name].append(key)
+                    
+            except Exception as e:
+                # Record error but continue - store the error in the object
+                import sys
+                print(f"Error loading {o_path}: {e}", file=sys.stderr)
+                obj_info.sections = {}
+                obj_info.relocations = {}
+            
+            self.objects[key] = obj_info
+            loaded += 1
+        
+        if progress_callback:
+            progress_callback(f"Loaded {loaded} objects, indexed {len(self._symbol_index)} symbols", 1.0)
+        
+        return loaded
+    
+    def find_symbol_provider(self, symbol_name: str) -> list[tuple[str, str]]:
+        """
+        Find which object(s) define a given symbol.
+        Returns list of (library, object_name) tuples.
+        """
+        return self._symbol_index.get(symbol_name, [])
+    
+    def mark_text_found(self, library: str, object_name: str, offset: int):
+        """Mark an object as having its .text found in the binary."""
+        key = (library, object_name)
+        if key in self.objects:
+            obj = self.objects[key]
+            obj.text_found = True
+            obj.section_offsets[".text"] = offset
+            obj.in_binary = True
+            obj.found_via = "text_scan"
+    
+    def resolve_references(self, progress_callback=None) -> int:
+        """
+        Resolve symbol references to find all objects in the binary.
+        
+        Starting from objects with text_found=True, follows undefined symbols
+        to find objects that are "pulled in" for their data/rdata/bss.
+        This is recursive - newly found objects also have their references resolved.
+        
+        Returns number of additional objects found.
+        """
+        # Start with objects that have .text found
+        found_objects = set(
+            key for key, obj in self.objects.items() 
+            if obj.text_found
+        )
+        
+        # Queue of objects to process
+        to_process = list(found_objects)
+        additional_found = 0
+        iterations = 0
+        max_iterations = 5000  # Safety limit (recursive can go deep)
+        
+        # Track which symbols we resolved for debugging
+        resolved_symbols = set()
+        
+        while to_process and iterations < max_iterations:
+            iterations += 1
+            current_key = to_process.pop(0)
+            current_obj = self.objects.get(current_key)
+            
+            if not current_obj:
+                continue
+            
+            if progress_callback and iterations % 50 == 0:
+                progress_callback(
+                    f"Resolving ({iterations} processed, {additional_found} found)...", 
+                    0.5
+                )
+            
+            current_lib = current_obj.library
+            
+            # Look up each undefined symbol
+            for sym_name in current_obj.undefined_symbols:
+                # Skip if already resolved
+                if sym_name in resolved_symbols:
+                    continue
+                
+                providers = self.find_symbol_provider(sym_name)
+                
+                if not providers:
+                    continue
+                
+                # Prefer provider from same library family
+                # LIBC2.LIB/X should prefer LIBC2.LIB/Y over LIBC.LIB/Z
+                best_provider = None
+                
+                # First try: exact same library
+                for provider_key in providers:
+                    if provider_key[0] == current_lib and provider_key not in found_objects:
+                        best_provider = provider_key
+                        break
+                
+                # Second try: same library base (LIBC2 matches LIBC2, not LIBC)
+                if not best_provider:
+                    current_lib_base = current_lib.replace('.LIB', '').rstrip('0123456789')
+                    for provider_key in providers:
+                        provider_lib_base = provider_key[0].replace('.LIB', '').rstrip('0123456789')
+                        if provider_lib_base == current_lib_base and provider_key not in found_objects:
+                            best_provider = provider_key
+                            break
+                
+                # Third try: any provider not already found
+                if not best_provider:
+                    for provider_key in providers:
+                        if provider_key not in found_objects:
+                            best_provider = provider_key
+                            break
+                
+                # If we found a provider that's not already in binary, add it
+                if best_provider and best_provider not in found_objects:
+                    provider_obj = self.objects.get(best_provider)
+                    if provider_obj:
+                        provider_obj.in_binary = True
+                        provider_obj.found_via = "symbol_reference"
+                        provider_obj.pulled_in_by.append(current_key)
+                        found_objects.add(best_provider)
+                        to_process.append(best_provider)  # Recursive!
+                        additional_found += 1
+                        resolved_symbols.add(sym_name)
+        
+        if progress_callback:
+            progress_callback(
+                f"Resolved {len(resolved_symbols)} symbols, found {additional_found} objects",
+                1.0
+            )
+        
+        return additional_found
+    
+    def get_data_only_objects(self) -> list[ObjectInfo]:
+        """
+        Get objects that are in the binary but have no .text found.
+        These have data/rdata/bss that need to be placed.
+        """
+        return [
+            obj for obj in self.objects.values()
+            if obj.in_binary and not obj.text_found
+        ]
+    
+    def get_objects_with_section(self, section: str, in_binary_only: bool = True) -> list[ObjectInfo]:
+        """Get all objects that have a given section."""
+        result = []
+        for obj in self.objects.values():
+            if in_binary_only and not obj.in_binary:
+                continue
+            if obj.has_section(section):
+                result.append(obj)
+        return result
 
 
 # =============================================================================
@@ -715,7 +1103,7 @@ def parse_elf_sections(elf_path: Path) -> dict[str, dict]:
 def parse_elf_symbols(elf_path: Path) -> list[dict]:
     """
     Parse ELF symbols using pyelftools.
-    Returns list of symbol dicts.
+    Returns list of symbol dicts with section names resolved.
     """
     if not PYELFTOOLS_AVAILABLE:
         return []
@@ -724,6 +1112,11 @@ def parse_elf_symbols(elf_path: Path) -> list[dict]:
     try:
         with open(elf_path, 'rb') as f:
             elf = ELFFile(f)
+            
+            # Build section index -> name mapping
+            section_names = {}
+            for idx, section in enumerate(elf.iter_sections()):
+                section_names[idx] = section.name
             
             # Find symbol table sections
             for section in elf.iter_sections():
@@ -738,9 +1131,16 @@ def parse_elf_symbols(elf_path: Path) -> list[dict]:
                     # Get section index - handle special values
                     shndx = sym['st_shndx']
                     if isinstance(shndx, str):
-                        ndx = shndx  # 'SHN_UNDEF', 'SHN_ABS', etc.
+                        # Special values: 'SHN_UNDEF', 'SHN_ABS', 'SHN_COMMON'
+                        ndx_str = shndx
+                        section_name = None
+                        is_undefined = (shndx == 'SHN_UNDEF')
+                        is_common = (shndx == 'SHN_COMMON')  # COMM symbols (uninitialized)
                     else:
-                        ndx = str(shndx)
+                        ndx_str = str(shndx)
+                        section_name = section_names.get(shndx, None)
+                        is_undefined = False
+                        is_common = False
                     
                     symbols.append({
                         "num": idx,
@@ -751,12 +1151,72 @@ def parse_elf_symbols(elf_path: Path) -> list[dict]:
                         "type": sym['st_info']['type'],
                         "bind": sym['st_info']['bind'],
                         "vis": sym['st_other']['visibility'],
-                        "ndx": ndx,
+                        "ndx": ndx_str,
+                        "section": section_name,  # Resolved section name
+                        "is_undefined": is_undefined,
+                        "is_common": is_common,
                     })
-    except Exception:
-        pass  # Will be handled by caller
+    except Exception as e:
+        # Log error but don't crash
+        import sys
+        print(f"Error parsing ELF symbols from {elf_path}: {e}", file=sys.stderr)
     
     return symbols
+
+
+def parse_elf_symbols_summary(elf_path: Path) -> dict:
+    """
+    Get a summary of defined and undefined symbols from an ELF file.
+    
+    Returns:
+    {
+        "defined": {
+            "symbol_name": {"section": ".data", "offset": 0x10, "size": 4, "type": "OBJECT"},
+            ...
+        },
+        "undefined": ["symbol_name1", "symbol_name2", ...],
+        "common": {
+            "symbol_name": {"size": 4},  # COMM symbols go to .bss
+            ...
+        }
+    }
+    """
+    symbols = parse_elf_symbols(elf_path)
+    
+    defined = {}
+    undefined = []
+    common = {}
+    
+    for sym in symbols:
+        name = sym["name"]
+        
+        # Skip local/file symbols and assembler-generated names
+        if sym["bind"] == "STB_LOCAL":
+            continue
+        if name.startswith("$"):  # MIPS register names like $LC0
+            continue
+        
+        if sym["is_undefined"]:
+            undefined.append(name)
+        elif sym["is_common"]:
+            # COMM symbols - these become .bss
+            common[name] = {
+                "size": sym["size"],
+            }
+        elif sym["section"]:
+            # Defined in a section
+            defined[name] = {
+                "section": sym["section"],
+                "offset": sym["value"],
+                "size": sym["size"],
+                "type": sym["type"],
+            }
+    
+    return {
+        "defined": defined,
+        "undefined": undefined,
+        "common": common,
+    }
 
 
 def parse_elf_relocations(elf_path: Path) -> dict[str, list[int]]:
@@ -1456,6 +1916,9 @@ class PSYQApp:
     def __init__(self):
         self.sdk_manager = SDKManager()
         
+        # Persistent configuration (loads from cache)
+        self.config = PersistentConfig()
+        
         # UI State
         self.versions: list[str] = []
         self.libraries: dict[str, list[str]] = {}
@@ -1495,10 +1958,10 @@ class PSYQApp:
         self.find_func_results: list[tuple[str, str, list[str]]] = []  # (library, object, [versions])
         self.find_func_searching = False
         
-        # Tab 5: Scan Binary
+        # Tab 5: Scan Binary - load paths from config
         self.scan_engine = ScanEngine(self.sdk_manager)
-        self.scan_binary_path = ""
-        self.scan_version_idx = 0  # 0 = All Versions
+        self.scan_binary_path = self.config.binary_path
+        self.scan_version_idx = 0  # Will be set after versions load
         self.scan_library_idx = 0  # 0 = All Libraries
         self.scan_results: list[ScanResult] = []
         self.scan_running = False
@@ -1510,8 +1973,8 @@ class PSYQApp:
         self.scan_binary_fingerprint = ""
         self.fp_store = FalsePositiveStore()
         
-        # Enrichment (readelf data from .o files)
-        self.enrich_repo_root = ""
+        # Enrichment (readelf data from .o files) - load paths from config
+        self.enrich_repo_root = self.config.repo_root
         self.enrich_obj_root = ""  # Resolved path to obj files
         self.enrich_data: dict[tuple[str, str], dict] = {}  # (library, object) -> readelf info
         self.enrich_errors: list[str] = []
@@ -1537,6 +2000,11 @@ class PSYQApp:
         # Section verification cache to avoid repeated file I/O
         # Key: (library, object, section, offset) -> (match_pct, matched, total)
         self.section_verify_cache: dict[tuple[str, str, str, int], tuple[float, int, int]] = {}
+        
+        # Object Database for symbol resolution and data-only object tracking
+        self.object_db = ObjectDatabase()
+        self.object_db_loaded = False
+        self.object_db_stats = ""  # Summary of loaded objects
         
         # Legacy block state (kept for compatibility during transition)
         self.blocks: list[dict] = []
@@ -1574,6 +2042,11 @@ class PSYQApp:
         self.versions = self.sdk_manager.discover_versions()
         if self.versions:
             self.status_message = f"Found {len(self.versions)} SDK versions"
+            
+            # Restore saved SDK version selection
+            saved_version = self.config.sdk_version
+            if saved_version and saved_version in self.versions:
+                self.scan_version_idx = self.versions.index(saved_version) + 1  # +1 because 0 is "All"
         else:
             self.status_message = "No SDK versions found - check internet connection"
     
@@ -2198,7 +2671,9 @@ class PSYQApp:
         
         # Binary path
         imgui.text("Binary File:")
-        _, self.scan_binary_path = imgui.input_text("##scan_binary_path", self.scan_binary_path, 512)
+        changed_path, self.scan_binary_path = imgui.input_text("##scan_binary_path", self.scan_binary_path, 512)
+        if changed_path and self.scan_binary_path:
+            self.config.binary_path = self.scan_binary_path
         imgui.same_line()
         if imgui.button("Browse##scan"):
             self.status_message = "File dialog not implemented - enter path manually"
@@ -2228,6 +2703,9 @@ class PSYQApp:
             self.scan_preprocessed = False
             self.scan_engine._preprocessed = False
             self.scan_results = []
+            # Save selected version
+            if self.scan_version_idx > 0:
+                self.config.sdk_version = self.versions[self.scan_version_idx - 1]
         
         # Library version overrides (collapsible)
         if self.versions:
@@ -2632,9 +3110,14 @@ class PSYQApp:
             imgui.text_colored(f"No objects with {section} sections found", 0.6, 0.6, 0.6, 1.0)
             return
         
-        # Count resolved
+        # Count resolved and data-only
         resolved_count = sum(1 for e in section_list if e["offset"] is not None)
+        data_only_count = sum(1 for e in section_list if e.get("data_only"))
+        
         imgui.text(f"{resolved_count}/{len(section_list)} offsets resolved")
+        if data_only_count > 0:
+            imgui.same_line()
+            imgui.text_colored(f"({data_only_count} data-only)", 0.8, 0.6, 1.0, 1.0)
         
         # Chain all button
         if resolved_count > 0 and resolved_count < len(section_list):
@@ -2643,6 +3126,15 @@ class PSYQApp:
                 for i in range(len(section_list)):
                     if section_list[i]["offset"] is None and i > 0:
                         self._chain_section_offset(section_list, i)
+        
+        # Sort by Offset button
+        if resolved_count > 1:
+            imgui.same_line()
+            if imgui.button(f"Sort##{section}"):
+                # Sort all entries with offsets by their offset value
+                # Entries without offsets stay at the end
+                section_list.sort(key=lambda e: (e["offset"] is None, e["offset"] or 0))
+                self.status_message = "Sorted by offset"
         
         # Clear all button
         if resolved_count > 0:
@@ -2699,13 +3191,22 @@ class PSYQApp:
                     self._move_section_entry(section_list, idx, 1)
             imgui.next_column()
             
-            # Library
+            # Library - show data-only indicator
             lib_display = entry["library"] if entry["library"] else "(loose)"
-            imgui.text(lib_display)
+            is_data_only = entry.get("data_only", False)
+            if is_data_only:
+                imgui.text_colored(lib_display, 0.8, 0.6, 1.0, 1.0)  # Purple for data-only
+            else:
+                imgui.text(lib_display)
             imgui.next_column()
             
-            # Object
-            imgui.text(entry["object"])
+            # Object - show indicator
+            if is_data_only:
+                imgui.text_colored(entry["object"], 0.8, 0.6, 1.0, 1.0)
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Data-only object (no .text in binary)")
+            else:
+                imgui.text(entry["object"])
             imgui.next_column()
             
             # Size
@@ -2764,6 +3265,16 @@ class PSYQApp:
                     if imgui.small_button(f"Diff##{row_id}"):
                         self._compute_section_diff(entry["library"], entry["object"], section, entry["offset"])
             
+            # Note button
+            imgui.same_line()
+            note_label = "Note*" if entry.get("note") else "Note"
+            if imgui.small_button(f"{note_label}##{row_id}"):
+                if not hasattr(self, '_note_edit_key') or self._note_edit_key != row_id:
+                    self._note_edit_key = row_id
+                    self._note_edit_str = entry.get("note", "")
+                else:
+                    self._note_edit_key = None
+            
             imgui.columns(1)
             
             # Manual input row
@@ -2784,6 +3295,8 @@ class PSYQApp:
                             entry["offset"] = int(val_str)
                         self._manual_input_key = None
                         self.status_message = f"Set offset to 0x{entry['offset']:X}"
+                        # Auto-sort data-only entries
+                        self._auto_sort_section_entry(section_list, entry)
                     except ValueError:
                         self.status_message = "Invalid offset format (use 0x1234 or decimal)"
                 imgui.same_line()
@@ -2795,7 +3308,14 @@ class PSYQApp:
             if self.section_search_key == (entry["library"], entry["object"], section) and self.section_search_results:
                 imgui.indent()
                 imgui.text_colored("Search results:", 0.6, 0.6, 0.6, 1.0)
-                for offset, match_pct in self.section_search_results[:5]:
+                imgui.same_line()
+                if imgui.small_button(f"Close##close_search_{row_id}"):
+                    self.section_search_results = []
+                    self.section_search_key = ("", "", "")
+                imgui.same_line()
+                imgui.text_colored(f"({len(self.section_search_results)} found)", 0.5, 0.5, 0.5, 1.0)
+                
+                for offset, match_pct in self.section_search_results[:10]:  # Show up to 10
                     if match_pct >= 99.9:
                         color = (0.3, 1.0, 0.3, 1.0)
                     elif match_pct >= 90:
@@ -2809,6 +3329,25 @@ class PSYQApp:
                         entry["offset"] = offset
                         self.section_search_results = []
                         self.section_search_key = ("", "", "")
+                        # Auto-sort data-only entries
+                        self._auto_sort_section_entry(section_list, entry)
+                imgui.unindent()
+            
+            # Notes input (inline, collapsible)
+            note = entry.get("note", "")
+            if note:
+                imgui.text_colored(f"  Note: {note}", 0.6, 0.8, 0.6, 1.0)
+            if hasattr(self, '_note_edit_key') and self._note_edit_key == row_id:
+                imgui.indent()
+                imgui.set_next_item_width(300)
+                _, self._note_edit_str = imgui.input_text(f"##note_{row_id}", self._note_edit_str, 256)
+                imgui.same_line()
+                if imgui.small_button(f"Save##save_note_{row_id}"):
+                    entry["note"] = self._note_edit_str
+                    self._note_edit_key = None
+                imgui.same_line()
+                if imgui.small_button(f"Cancel##cancel_note_{row_id}"):
+                    self._note_edit_key = None
                 imgui.unindent()
             
             # Show inline diff if this is the current diff
@@ -3007,9 +3546,11 @@ class PSYQApp:
                 "Example: ~/chrono-cross-decomp or ~/psyq"
             )
         
-        _, self.enrich_repo_root = imgui.input_text(
+        changed_repo, self.enrich_repo_root = imgui.input_text(
             "##enrich_repo_root", self.enrich_repo_root, 512
         )
+        if changed_repo and self.enrich_repo_root:
+            self.config.repo_root = self.enrich_repo_root
         
         # Enrich button
         if PYELFTOOLS_AVAILABLE and self.enrich_repo_root and version_filter:
@@ -3052,9 +3593,99 @@ class PSYQApp:
         
         imgui.separator()
         
-        # === Section Ordering (new approach) ===
+        # === Step 2: Object Database and Reference Resolution ===
+        if self.enrich_data and version_filter:
+            imgui.text_colored("Step 2: Find Data-Only Objects (Symbol Resolution)", 0.4, 0.8, 1.0, 1.0)
+            imgui.text_colored(
+                "Load full object database and resolve references to find objects that contribute",
+                0.6, 0.6, 0.6, 1.0
+            )
+            imgui.text_colored(
+                "data/rdata/bss without .text (pulled in by undefined symbol references).",
+                0.6, 0.6, 0.6, 1.0
+            )
+            
+            # Load Object Database button
+            if imgui.button("Load Object Database", width=180):
+                self._do_load_object_database()
+            
+            imgui.same_line()
+            if self.object_db_loaded:
+                imgui.text_colored(
+                    f"Loaded: {len(self.object_db.objects)} objects",
+                    0.3, 1.0, 0.3, 1.0
+                )
+            else:
+                imgui.text_colored(
+                    "Not loaded - click to load all objects from SDK",
+                    0.5, 0.5, 0.5, 1.0
+                )
+            
+            # Resolve References button (only if database is loaded)
+            if self.object_db_loaded:
+                if imgui.button("Resolve References", width=180):
+                    self._do_resolve_references()
+                
+                imgui.same_line()
+                
+                # Show stats
+                text_found_count = sum(1 for o in self.object_db.objects.values() if o.text_found)
+                data_only_count = sum(1 for o in self.object_db.objects.values() if o.in_binary and not o.text_found)
+                
+                if data_only_count > 0:
+                    imgui.text_colored(
+                        f"In binary: {text_found_count} .text + {data_only_count} data-only",
+                        0.8, 1.0, 0.3, 1.0
+                    )
+                elif text_found_count > 0:
+                    imgui.text_colored(
+                        f"In binary: {text_found_count} .text objects (run resolve to find data-only)",
+                        0.6, 0.6, 0.6, 1.0
+                    )
+                
+                # Show data-only objects if any
+                data_only_objs = self.object_db.get_data_only_objects()
+                if data_only_objs:
+                    expanded, _ = imgui.collapsing_header(f"Data-Only Objects ({len(data_only_objs)})")
+                    if expanded:
+                        imgui.begin_child("data_only_list", 0, 150, border=True)
+                        for obj in data_only_objs[:50]:
+                            pulled_by = ", ".join(f"{p[0]}/{p[1]}" for p in obj.pulled_in_by[:2])
+                            if len(obj.pulled_in_by) > 2:
+                                pulled_by += f" +{len(obj.pulled_in_by)-2}"
+                            
+                            sections = []
+                            if obj.has_section(".data"):
+                                sections.append(f".data:{obj.section_size('.data'):X}")
+                            if obj.has_section(".rdata"):
+                                sections.append(f".rdata:{obj.section_size('.rdata'):X}")
+                            if obj.has_section(".bss"):
+                                sections.append(f".bss:{obj.section_size('.bss'):X}")
+                            
+                            sec_str = " ".join(sections) if sections else "(no sections)"
+                            imgui.text(f"{obj.library}/{obj.name}")
+                            imgui.same_line()
+                            imgui.text_colored(f"  {sec_str}", 0.5, 0.8, 0.5, 1.0)
+                            if pulled_by:
+                                imgui.same_line()
+                                imgui.text_colored(f"  <- {pulled_by}", 0.5, 0.5, 0.5, 1.0)
+                        if len(data_only_objs) > 50:
+                            imgui.text_colored(f"... and {len(data_only_objs) - 50} more", 0.5, 0.5, 0.5, 1.0)
+                        imgui.end_child()
+                
+                # Quick stats with link to Symbol Browser
+                text_found = sum(1 for o in self.object_db.objects.values() if o.text_found)
+                data_only = sum(1 for o in self.object_db.objects.values() if o.in_binary and not o.text_found)
+                sym_count = len(self.object_db._symbol_index)
+                
+                imgui.text(f"Quick stats: {sym_count} symbols indexed, {text_found} .text in binary, {data_only} data-only")
+                imgui.text_colored("→ Use Symbol Browser tab for detailed symbol/object exploration", 0.5, 0.8, 1.0, 1.0)
+            
+            imgui.separator()
+        
+        # === Step 3: Section Ordering ===
         if self.data_section_list or self.rdata_section_list:
-            imgui.text_colored("Step 2: Data Section Offsets", 0.4, 0.8, 1.0, 1.0)
+            imgui.text_colored("Step 3: Data Section Offsets", 0.4, 0.8, 1.0, 1.0)
             imgui.text_colored(
                 "Resolve offsets for .data/.rdata sections. Reorder if needed, then search or chain offsets.",
                 0.6, 0.6, 0.6, 1.0
@@ -3074,9 +3705,9 @@ class PSYQApp:
             
             imgui.separator()
         
-        # === Legacy Block Analysis Section (for transition) ===
+        # === Legacy Block Analysis Section (deprecated, for transition) ===
         if self.blocks:
-            imgui.text_colored("Step 2: Resolve .data/.rdata Block Offsets", 0.4, 0.8, 1.0, 1.0)
+            imgui.text_colored("(Legacy) Block-Based Offset Resolution", 0.5, 0.5, 0.5, 1.0)
             imgui.text_colored(
                 f"Found {len(self.blocks)} contiguous block(s). Resolve block start offsets to enable precise .data/.rdata export.",
                 0.6, 0.6, 0.6, 1.0
@@ -3189,7 +3820,7 @@ class PSYQApp:
             imgui.separator()
         
         # === Export Section ===
-        imgui.text_colored("Step 3: Export", 0.4, 0.8, 1.0, 1.0)
+        imgui.text_colored("Step 4: Export", 0.4, 0.8, 1.0, 1.0)
         
         # Export Splat YAML
         can_export_splat = (
@@ -3224,6 +3855,13 @@ class PSYQApp:
             self._export_scan_results_json()
         imgui.same_line()
         imgui.text_colored("(includes section sizes and symbols if enriched)", 0.5, 0.5, 0.5, 1.0)
+        
+        # Object-centric export (new format)
+        if self.object_db_loaded:
+            if imgui.button("Export Object Database JSON", width=220):
+                self._export_object_database_json()
+            imgui.same_line()
+            imgui.text_colored("(object-centric format with all sections)", 0.5, 0.5, 0.5, 1.0)
         
         imgui.separator()
         
@@ -3563,6 +4201,112 @@ class PSYQApp:
         except Exception as e:
             self.status_message = f"Export failed: {e}"
     
+    def _export_object_database_json(self):
+        """Export object-centric JSON with all sections and resolved offsets."""
+        if not self.object_db_loaded:
+            self.status_message = "Load object database first"
+            return
+        
+        # Default export path next to the binary
+        if self.scan_binary_path:
+            base = os.path.splitext(self.scan_binary_path)[0]
+            export_path = f"{base}_objects.json"
+        else:
+            export_path = "objects.json"
+        
+        # Build lookup for section offsets from the UI lists
+        data_offsets = {(e["library"], e["object"]): e["offset"] for e in self.data_section_list if e["offset"] is not None}
+        rdata_offsets = {(e["library"], e["object"]): e["offset"] for e in self.rdata_section_list if e["offset"] is not None}
+        
+        try:
+            objects_list = []
+            
+            # Export only objects that are in the binary
+            for key, obj in self.object_db.objects.items():
+                if not obj.in_binary:
+                    continue
+                
+                # Build sections dict with both ELF and binary offsets
+                sections = {}
+                for sec_name, sec_info in obj.sections.items():
+                    if sec_info.get("size", 0) > 0:
+                        # Check for resolved offset
+                        binary_offset = obj.section_offsets.get(sec_name)
+                        
+                        # Also check section lists for .data/.rdata
+                        obj_key = (obj.library, obj.name)
+                        if sec_name == ".data" and obj_key in data_offsets:
+                            binary_offset = data_offsets[obj_key]
+                        elif sec_name == ".rdata" and obj_key in rdata_offsets:
+                            binary_offset = rdata_offsets[obj_key]
+                        
+                        sections[sec_name] = {
+                            "elf_size": sec_info.get("size", 0),
+                            "elf_offset": sec_info.get("offset", 0),
+                            "binary_offset": binary_offset,
+                            "relocations": obj.relocations.get(sec_name, []),
+                        }
+                
+                # Build simplified symbols
+                defined_syms = {}
+                for sym_name, sym_info in obj.defined_symbols.items():
+                    defined_syms[sym_name] = {
+                        "section": sym_info.get("section"),
+                        "offset": sym_info.get("offset", 0),
+                        "size": sym_info.get("size", 0),
+                    }
+                
+                obj_entry = {
+                    "library": obj.library,
+                    "object": obj.name,
+                    "version": obj.version,
+                    "obj_path": obj.obj_path,
+                    "found_via": obj.found_via,
+                    "sections": sections,
+                    "symbols": {
+                        "defined": defined_syms,
+                        "undefined": obj.undefined_symbols,
+                        "common": obj.common_symbols,
+                    },
+                }
+                
+                # Add pulled_in_by for data-only objects
+                if obj.pulled_in_by:
+                    obj_entry["pulled_in_by"] = [
+                        {"library": lib, "object": name}
+                        for lib, name in obj.pulled_in_by
+                    ]
+                
+                objects_list.append(obj_entry)
+            
+            # Sort: text_scan objects first (by .text offset), then symbol_reference objects
+            def sort_key(o):
+                text_offset = None
+                if ".text" in o["sections"]:
+                    text_offset = o["sections"][".text"].get("binary_offset")
+                found_order = 0 if o["found_via"] == "text_scan" else 1
+                return (found_order, text_offset or 0xFFFFFFFF)
+            
+            objects_list.sort(key=sort_key)
+            
+            # Build final output
+            output = {
+                "binary": self.scan_binary_path,
+                "version": self.object_db.loaded_version,
+                "obj_root": str(self.object_db.obj_root),
+                "total_objects": len(objects_list),
+                "text_found_count": sum(1 for o in objects_list if o["found_via"] == "text_scan"),
+                "reference_found_count": sum(1 for o in objects_list if o["found_via"] == "symbol_reference"),
+                "objects": objects_list,
+            }
+            
+            with open(export_path, "w") as f:
+                json.dump(output, f, indent=2)
+            
+            self.status_message = f"Exported {len(objects_list)} objects to {export_path}"
+        except Exception as e:
+            self.status_message = f"Export failed: {e}"
+
     def _do_enrich(self):
         """Enrich scan results with readelf data from .o files."""
         if not self.enrich_repo_root or not self.scan_results:
@@ -3712,6 +4456,149 @@ class PSYQApp:
         
         self.status_message = f"Initialized {len(self.data_section_list)} .data, {len(self.rdata_section_list)} .rdata entries"
     
+    def _do_load_object_database(self):
+        """Load the full object database for symbol resolution."""
+        if not self.enrich_repo_root:
+            self.status_message = "Set PSY-Q object files path first"
+            return
+        
+        version_filter = None
+        if self.scan_version_idx > 0 and self.versions:
+            version_filter = self.versions[self.scan_version_idx - 1]
+        
+        if not version_filter:
+            self.status_message = "Select a specific SDK version first"
+            return
+        
+        repo_root = Path(self.enrich_repo_root).expanduser()
+        
+        # Find obj root
+        possible_roots = [
+            repo_root / "assets" / "psyq" / version_filter / "obj",
+            repo_root / version_filter / "obj",
+            repo_root / "obj",
+        ]
+        
+        obj_root = None
+        for root in possible_roots:
+            if root.exists():
+                obj_root = root
+                break
+        
+        if not obj_root:
+            self.status_message = f"Could not find obj directory for {version_filter}"
+            return
+        
+        self.status_message = f"Loading object database from {obj_root}..."
+        
+        def progress_cb(msg, pct):
+            self.status_message = msg
+        
+        loaded = self.object_db.load_objects_for_version(
+            version_filter, obj_root, progress_callback=progress_cb
+        )
+        
+        # Mark objects that were found via .text scanning
+        marked = 0
+        not_found = []
+        for r in self.scan_results:
+            if self.scan_binary_fingerprint and self.fp_store.is_false_positive(
+                self.scan_binary_fingerprint, r.offset, r.library, r.object_name
+            ):
+                continue
+            if r.is_ambiguous:
+                continue
+            
+            key = (r.library, r.object_name)
+            if key in self.object_db.objects:
+                self.object_db.mark_text_found(r.library, r.object_name, r.offset)
+                marked += 1
+            else:
+                not_found.append(f"{r.library}/{r.object_name}")
+        
+        text_found = sum(1 for o in self.object_db.objects.values() if o.text_found)
+        sym_count = len(self.object_db._symbol_index)
+        self.object_db_loaded = True
+        
+        # Show warning if some scan results weren't found
+        if not_found:
+            import sys
+            print(f"Warning: {len(not_found)} scan results not found in object database:", file=sys.stderr)
+            for nf in not_found[:10]:
+                print(f"  {nf}", file=sys.stderr)
+        
+        self.status_message = f"Loaded {loaded} objects, {text_found} .text in binary, {sym_count} symbols indexed"
+    
+    def _do_resolve_references(self):
+        """Resolve symbol references to find data-only objects."""
+        if not self.object_db_loaded:
+            self.status_message = "Load object database first"
+            return
+        
+        def progress_cb(msg, pct):
+            self.status_message = msg
+        
+        additional = self.object_db.resolve_references(progress_cb)
+        
+        data_only_count = len(self.object_db.get_data_only_objects())
+        self.status_message = f"Found {additional} additional objects ({data_only_count} data-only)"
+        
+        # Update section lists to include data-only objects
+        self._update_section_lists_with_data_only()
+    
+    def _update_section_lists_with_data_only(self):
+        """Add data-only objects to the section lists."""
+        data_only_objs = self.object_db.get_data_only_objects()
+        
+        # Add data-only objects to the END of each list (they need to be slotted into gaps)
+        for obj in data_only_objs:
+            key = (obj.library, obj.name)
+            
+            # Skip if already in lists
+            existing_data = [e for e in self.data_section_list if e["library"] == obj.library and e["object"] == obj.name]
+            existing_rdata = [e for e in self.rdata_section_list if e["library"] == obj.library and e["object"] == obj.name]
+            
+            # Add to .data list if has .data section
+            if obj.has_section(".data") and not existing_data:
+                self.data_section_list.append({
+                    "library": obj.library,
+                    "object": obj.name,
+                    "offset": None,
+                    "size": obj.section_size(".data"),
+                    "data_only": True,  # Flag to indicate this is a data-only object
+                })
+            
+            # Add to .rdata list if has .rdata section
+            if obj.has_section(".rdata") and not existing_rdata:
+                self.rdata_section_list.append({
+                    "library": obj.library,
+                    "object": obj.name,
+                    "offset": None,
+                    "size": obj.section_size(".rdata"),
+                    "data_only": True,
+                })
+        
+        # Also make sure we have enrichment data for these objects
+        for obj in data_only_objs:
+            key = (obj.library, obj.name)
+            if key not in self.enrich_data:
+                # Add enrichment data from the object database
+                self.enrich_data[key] = {
+                    "obj_path": obj.obj_path,
+                    "sections": obj.sections,
+                    "section_sizes": {
+                        sec: obj.sections.get(sec, {}).get("size", 0)
+                        for sec in [".text", ".data", ".rdata", ".bss", ".sdata", ".sbss"]
+                    },
+                    "relocations": obj.relocations,
+                    "version_used": obj.version,
+                    "data_only": True,
+                }
+        
+        text_based = sum(1 for e in self.data_section_list if not e.get("data_only"))
+        data_only_in_list = sum(1 for e in self.data_section_list if e.get("data_only"))
+        self.status_message = f"Section lists updated: {text_based} from .text order, {data_only_in_list} data-only"
+
     def _search_single_section(self, library: str, object_name: str, section: str, search_start: int = 0):
         """
         Search binary for a single object's .data or .rdata section.
@@ -3953,6 +4840,42 @@ class PSYQApp:
         new_idx = idx + direction
         if 0 <= new_idx < len(section_list):
             section_list[idx], section_list[new_idx] = section_list[new_idx], section_list[idx]
+    
+    def _auto_sort_section_entry(self, section_list: list[dict], entry: dict):
+        """
+        Auto-sort a data-only entry into its correct position based on offset.
+        Only applies to entries with data_only=True and a set offset.
+        Moves the entry to maintain ascending offset order.
+        """
+        if not entry.get("data_only") or entry.get("offset") is None:
+            return
+        
+        offset = entry["offset"]
+        
+        # Find current position
+        try:
+            current_idx = section_list.index(entry)
+        except ValueError:
+            return
+        
+        # Find correct position based on offset
+        # Should be after the last entry with offset < this offset
+        # and before the first entry with offset > this offset
+        target_idx = 0
+        for i, e in enumerate(section_list):
+            if e is entry:
+                continue
+            if e["offset"] is not None and e["offset"] < offset:
+                target_idx = i + 1 if i < current_idx else i
+        
+        # Move if needed
+        if target_idx != current_idx:
+            section_list.remove(entry)
+            # Adjust target if we removed from before it
+            if current_idx < target_idx:
+                target_idx -= 1
+            section_list.insert(target_idx, entry)
+            self.status_message = f"Auto-sorted to position {target_idx + 1}"
     
     def _compute_section_diff(self, library: str, object_name: str, section: str, binary_offset: int):
         """
@@ -4692,14 +5615,24 @@ class PSYQApp:
                                 gap_size = offset - prev_end
                                 f.write(f"      - [0x{prev_end:X}, {gap_type}]  # gap: 0x{gap_size:X}\n")
                             
-                            f.write(f"      - [0x{offset:X}, lib, {lib_name}, {obj_stem}, {section_name}]  # size: 0x{size:X}\n")
+                            # Build comment with size and optional note
+                            comment = f"size: 0x{size:X}"
+                            note = entry.get("note", "")
+                            if note:
+                                comment += f" | {note}"
+                            
+                            f.write(f"      - [0x{offset:X}, lib, {lib_name}, {obj_stem}, {section_name}]  # {comment}\n")
                             
                             # Update prev_end (align to 4 bytes)
                             prev_end = offset + size
                             prev_end = (prev_end + 3) & ~3  # align up to 4
                         else:
                             # No resolved offset - can't track gaps
-                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, {section_name}]  # size: 0x{size:X}\n")
+                            note = entry.get("note", "")
+                            comment = f"size: 0x{size:X}"
+                            if note:
+                                comment += f" | {note}"
+                            f.write(f"      - [auto, lib, {lib_name}, {obj_stem}, {section_name}]  # {comment}\n")
                 
                 # Write .data and .rdata using the new section lists
                 write_section_from_list(".data", self.data_section_list, data_offsets)
@@ -5001,6 +5934,258 @@ class PSYQApp:
             imgui.text_colored(ascii_str, 0.5, 0.5, 0.5, 1.0)
         
         imgui.end_child()
+    
+    def render_symbol_browser_tab(self):
+        """Render the Symbol Browser tab for exploring object database."""
+        imgui.text("Browse and search symbols and objects in the loaded database")
+        imgui.separator()
+        
+        if not self.object_db_loaded:
+            imgui.text_colored(
+                "Object database not loaded.",
+                0.8, 0.6, 0.3, 1.0
+            )
+            imgui.spacing()
+            
+            # Show current config and allow loading directly
+            imgui.text("Configuration:")
+            
+            # SDK Version
+            imgui.text("SDK Version:")
+            imgui.same_line()
+            version_options = ["(Select Version)"] + self.versions
+            changed_ver, new_idx = imgui.combo(
+                "##sym_browser_version", 
+                self.scan_version_idx if self.scan_version_idx < len(version_options) else 0, 
+                version_options
+            )
+            if changed_ver:
+                self.scan_version_idx = new_idx
+                if new_idx > 0:
+                    self.config.sdk_version = self.versions[new_idx - 1]
+            
+            # Repo root
+            imgui.text("PSY-Q Object Files Root:")
+            changed_repo, self.enrich_repo_root = imgui.input_text(
+                "##sym_browser_repo", self.enrich_repo_root, 512
+            )
+            if changed_repo and self.enrich_repo_root:
+                self.config.repo_root = self.enrich_repo_root
+            
+            imgui.spacing()
+            
+            # Load button
+            can_load = self.scan_version_idx > 0 and self.enrich_repo_root
+            if can_load:
+                if imgui.button("Load Object Database", width=200):
+                    self._do_load_object_database()
+            else:
+                imgui.text_colored("Select SDK version and set repo root to load", 0.5, 0.5, 0.5, 1.0)
+            
+            return
+        
+        # Stats header
+        total_objects = len(self.object_db.objects)
+        in_binary = sum(1 for o in self.object_db.objects.values() if o.in_binary)
+        text_found = sum(1 for o in self.object_db.objects.values() if o.text_found)
+        data_only = sum(1 for o in self.object_db.objects.values() if o.in_binary and not o.text_found)
+        sym_count = len(self.object_db._symbol_index)
+        
+        imgui.text(f"Database: {total_objects} objects | {sym_count} symbols indexed")
+        imgui.text(f"In binary: {in_binary} total ({text_found} via .text scan, {data_only} via symbol reference)")
+        imgui.separator()
+        
+        # Two-column layout
+        imgui.columns(2, "sym_browser_cols")
+        imgui.set_column_width(0, 400)
+        
+        # Left column: Symbol lookup
+        imgui.text_colored("Symbol Lookup", 0.4, 0.8, 1.0, 1.0)
+        
+        if not hasattr(self, '_sym_browser_query'):
+            self._sym_browser_query = ""
+        
+        imgui.text("Search symbol:")
+        imgui.set_next_item_width(300)
+        _, self._sym_browser_query = imgui.input_text("##sym_search", self._sym_browser_query, 128)
+        
+        if self._sym_browser_query:
+            query = self._sym_browser_query.lower()
+            
+            # Find matching symbols
+            matching_syms = [
+                sym for sym in self.object_db._symbol_index.keys()
+                if query in sym.lower()
+            ][:50]  # Limit results
+            
+            imgui.begin_child("sym_results", 380, 200, border=True)
+            for sym in matching_syms:
+                providers = self.object_db._symbol_index[sym]
+                
+                # Expand on click
+                expanded = imgui.tree_node(f"{sym} ({len(providers)} provider(s))##sym_{sym}")
+                if expanded:
+                    for lib, obj_name in providers:
+                        obj = self.object_db.objects.get((lib, obj_name))
+                        if obj:
+                            status = ""
+                            if obj.in_binary:
+                                if obj.text_found:
+                                    status = " [.text in binary]"
+                                else:
+                                    status = " [data-only in binary]"
+                            
+                            sym_info = obj.defined_symbols.get(sym, {})
+                            section = sym_info.get("section", "?")
+                            
+                            imgui.text(f"  {lib}/{obj_name} ({section}){status}")
+                    imgui.tree_pop()
+            
+            if len(matching_syms) == 50:
+                imgui.text_colored("(showing first 50 matches)", 0.5, 0.5, 0.5, 1.0)
+            imgui.end_child()
+        
+        imgui.separator()
+        
+        # Object search
+        imgui.text_colored("Object Search", 0.4, 0.8, 1.0, 1.0)
+        
+        if not hasattr(self, '_obj_browser_query'):
+            self._obj_browser_query = ""
+        
+        imgui.text("Search object:")
+        imgui.set_next_item_width(300)
+        _, self._obj_browser_query = imgui.input_text("##obj_search", self._obj_browser_query, 128)
+        
+        if self._obj_browser_query:
+            query = self._obj_browser_query.upper()
+            
+            # Find matching objects
+            matching_objs = [
+                (key, obj) for key, obj in self.object_db.objects.items()
+                if query in key[0] or query in key[1]
+            ][:30]
+            
+            imgui.begin_child("obj_results", 380, 200, border=True)
+            for (lib, name), obj in matching_objs:
+                # Color based on status
+                if obj.in_binary and obj.text_found:
+                    color = (0.3, 1.0, 0.3, 1.0)
+                elif obj.in_binary:
+                    color = (0.8, 0.6, 1.0, 1.0)  # Purple for data-only
+                else:
+                    color = (0.6, 0.6, 0.6, 1.0)
+                
+                expanded = imgui.tree_node(f"{lib}/{name}##obj_{lib}_{name}")
+                if expanded:
+                    # Sections
+                    sections = [s for s, info in obj.sections.items() if info.get("size", 0) > 0]
+                    imgui.text(f"Sections: {', '.join(sections) if sections else '(none)'}")
+                    
+                    # Status
+                    if obj.in_binary:
+                        imgui.text_colored(f"In binary via: {obj.found_via}", 0.3, 1.0, 0.3, 1.0)
+                        if obj.pulled_in_by:
+                            pulled_by_str = ", ".join(f"{p[1]}" for p in obj.pulled_in_by[:3])
+                            if len(obj.pulled_in_by) > 3:
+                                pulled_by_str += f" +{len(obj.pulled_in_by)-3}"
+                            imgui.text(f"Pulled in by: {pulled_by_str}")
+                    else:
+                        imgui.text_colored("Not in binary", 0.5, 0.5, 0.5, 1.0)
+                    
+                    # Defined symbols
+                    if obj.defined_symbols:
+                        imgui.text(f"Defines {len(obj.defined_symbols)} symbols:")
+                        for sym_name in list(obj.defined_symbols.keys())[:5]:
+                            sym_info = obj.defined_symbols[sym_name]
+                            imgui.text(f"  {sym_name} ({sym_info.get('section', '?')})")
+                        if len(obj.defined_symbols) > 5:
+                            imgui.text(f"  ... +{len(obj.defined_symbols)-5} more")
+                    
+                    # Undefined symbols
+                    if obj.undefined_symbols:
+                        imgui.text(f"References {len(obj.undefined_symbols)} undefined:")
+                        for sym_name in obj.undefined_symbols[:5]:
+                            # Check if resolved
+                            providers = self.object_db.find_symbol_provider(sym_name)
+                            if providers:
+                                prov_str = f" -> {providers[0][1]}"
+                            else:
+                                prov_str = " (unresolved!)"
+                            imgui.text(f"  {sym_name}{prov_str}")
+                        if len(obj.undefined_symbols) > 5:
+                            imgui.text(f"  ... +{len(obj.undefined_symbols)-5} more")
+                    
+                    imgui.tree_pop()
+            imgui.end_child()
+        
+        imgui.next_column()
+        
+        # Right column: Objects in binary
+        imgui.text_colored("Objects in Binary", 0.4, 0.8, 1.0, 1.0)
+        
+        # Filter options
+        if not hasattr(self, '_show_text_found'):
+            self._show_text_found = True
+            self._show_data_only = True
+        
+        _, self._show_text_found = imgui.checkbox("Show .text found", self._show_text_found)
+        imgui.same_line()
+        _, self._show_data_only = imgui.checkbox("Show data-only", self._show_data_only)
+        
+        imgui.begin_child("binary_objects", 0, 400, border=True)
+        
+        # Get filtered objects
+        binary_objs = []
+        for key, obj in self.object_db.objects.items():
+            if not obj.in_binary:
+                continue
+            if obj.text_found and not self._show_text_found:
+                continue
+            if not obj.text_found and not self._show_data_only:
+                continue
+            binary_objs.append((key, obj))
+        
+        # Sort by text offset (text found first), then by name
+        def sort_key(item):
+            key, obj = item
+            text_offset = obj.section_offsets.get(".text", 0xFFFFFFFF)
+            return (0 if obj.text_found else 1, text_offset, key[0], key[1])
+        
+        binary_objs.sort(key=sort_key)
+        
+        for (lib, name), obj in binary_objs[:100]:
+            # Color based on type
+            if obj.text_found:
+                text_off = obj.section_offsets.get(".text", 0)
+                imgui.text(f"0x{text_off:06X}")
+                imgui.same_line()
+                imgui.text(f"{lib}/{name}")
+            else:
+                imgui.text("      ")
+                imgui.same_line()
+                imgui.text_colored(f"{lib}/{name}", 0.8, 0.6, 1.0, 1.0)
+                imgui.same_line()
+                imgui.text_colored("(data-only)", 0.5, 0.5, 0.5, 1.0)
+        
+        if len(binary_objs) > 100:
+            imgui.text_colored(f"... +{len(binary_objs)-100} more", 0.5, 0.5, 0.5, 1.0)
+        
+        imgui.end_child()
+        
+        imgui.columns(1)
+        
+        imgui.separator()
+        
+        # Debug/Release detection hint
+        imgui.text_colored("Note on Debug vs Release Libraries:", 0.8, 0.8, 0.3, 1.0)
+        imgui.text_wrapped(
+            "PSY-Q SDK includes both debug and release versions of some libraries. "
+            "Debug versions have full implementations (e.g., sprintf with formatting code), "
+            "while release versions may have stubs (e.g., sprintf as just 'jr $ra; nop'). "
+            "If your .o files are debug but the game linked release, .text signatures won't match, "
+            "and data sections like format strings won't be present in the binary."
+        )
     
     def render_verify_splat_tab(self):
         """Render the Splat YAML verification tab."""
@@ -5410,6 +6595,10 @@ class PSYQApp:
             
             if imgui.begin_tab_item("Enrich & Export")[0]:
                 self.render_enrich_tab()
+                imgui.end_tab_item()
+            
+            if imgui.begin_tab_item("Symbol Browser")[0]:
+                self.render_symbol_browser_tab()
                 imgui.end_tab_item()
             
             if imgui.begin_tab_item("Verify Splat")[0]:
